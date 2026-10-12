@@ -84,6 +84,16 @@ async def create_field(
     if not farm or farm.org_id != ctx.org_id or farm.deleted_at is not None:
         raise HTTPException(status_code=404, detail="Farm not found")
 
+    # Idempotent create (AgroMind integration): a client-supplied id that
+    # already exists returns the existing field as-is, without dispatching
+    # new backfill tasks. A retry after a lost response is then harmless.
+    if body.id is not None:
+        existing = await db.get(Field, body.id)
+        if existing is not None:
+            if existing.org_id != ctx.org_id:
+                raise HTTPException(status_code=409, detail="Field id already exists")
+            return _field_to_out(existing)
+
     try:
         multi = _geojson_to_multi(body.geom)
     except (ValueError, Exception) as e:
@@ -110,6 +120,8 @@ async def create_field(
         tags_json=body.tags,
         created_by=ctx.user.id,
     )
+    if body.id is not None:
+        field.id = body.id
     db.add(field)
     await db.flush()
 
@@ -153,8 +165,17 @@ async def create_field(
     from app.tasks.backfill import backfill_indices_for_field
     from app.tasks.soil import fetch_soil_for_field
 
-    backfill_weather_for_field.delay(str(field.id))
-    backfill_indices_for_field.delay(str(field.id), sentinel_job_id=str(sentinel.id))
+    # backfill_months (AgroMind integration) bounds the initial analysis
+    # window; None keeps the server defaults.
+    backfill_weather_for_field.delay(
+        str(field.id),
+        days=body.backfill_months * 30 if body.backfill_months else None,
+    )
+    backfill_indices_for_field.delay(
+        str(field.id),
+        sentinel_job_id=str(sentinel.id),
+        months=body.backfill_months,
+    )
     fetch_soil_for_field.delay(str(field.id))
 
     return _field_to_out(field)
@@ -223,6 +244,26 @@ async def delete_field(
         raise HTTPException(status_code=404, detail="Field not found")
     field.deleted_at = datetime.now(timezone.utc)
     await db.flush()
+
+
+@router.post("/fields/{field_id}/restore", response_model=FieldOut)
+async def restore_field(
+    field_id: uuid.UUID,
+    ctx: Annotated[OrgContext, Depends(_writer)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    """Undo a soft delete (AgroMind integration).
+
+    Restores the field together with its raster history and stats, which a
+    soft delete never removes. Idempotent: restoring a live field is a no-op.
+    """
+    field = await db.get(Field, field_id)
+    if not field or field.org_id != ctx.org_id:
+        raise HTTPException(status_code=404, detail="Field not found")
+    if field.deleted_at is not None:
+        field.deleted_at = None
+        await db.flush()
+    return _field_to_out(field)
 
 
 @router.post("/fields/import", response_model=FieldImportResponse)

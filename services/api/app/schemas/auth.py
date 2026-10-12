@@ -38,6 +38,9 @@ class OrgBrief(BaseModel):
 
 class OrgCreate(BaseModel):
     name: str
+    # AgroMind integration: client-supplied id for idempotent provisioning
+    # (a retried create returns the existing org instead of duplicating it).
+    id: uuid.UUID | None = None
 
 
 class OrgUpdate(BaseModel):
