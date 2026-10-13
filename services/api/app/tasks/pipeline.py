@@ -21,12 +21,14 @@ from rio_cogeo.cogeo import cog_translate
 from rio_cogeo.profiles import cog_profiles
 from minio import Minio
 from pystac_client import Client as STACClient
-from sqlalchemy import select
+from sqlalchemy import func, literal, select
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm.attributes import flag_modified
 
 import structlog
 
+from app.core.config import settings
 from app.tasks.indices import IndexDef
 
 logger = structlog.get_logger()
@@ -342,6 +344,9 @@ def run_alerts(
     """Evaluate threshold and drop alert rules for any index type."""
     from app.models.tables import Alert
 
+    if not settings.openfarm_alert_rules_enabled:
+        return
+
     current_mean = stats.get("mean")
     if current_mean is None:
         return
@@ -536,6 +541,14 @@ def process_scene(
             "pipeline_version": "2.0.0",
         },
     )
+    # Reprocessing an existing date keeps the original params/provenance
+    # (e.g. is_backfill and the backfill window) and records the latest run
+    # under its own keys, so the origin of the data is never lost.
+    reprocess_params = {
+        **layer_values["params_json"],
+        "job_id": str(job.id),
+        "is_backfill": bool((job.params_json or {}).get("is_backfill", False)),
+    }
     stmt = (
         pg_insert(RasterLayer)
         .values(**layer_values)
@@ -545,8 +558,25 @@ def process_scene(
                 "cog_uri": cog_uri,
                 "min": data_min,
                 "max": data_max,
-                "params_json": layer_values["params_json"],
-                "provenance_json": layer_values["provenance_json"],
+                "params_json": func.coalesce(
+                    RasterLayer.__table__.c.params_json, literal({}, type_=JSONB)
+                ).op("||")(
+                    literal({"last_reprocess": reprocess_params}, type_=JSONB)
+                ),
+                "provenance_json": func.coalesce(
+                    RasterLayer.__table__.c.provenance_json, literal({}, type_=JSONB)
+                ).op("||")(
+                    literal(
+                        {
+                            "last_reprocessed_at": layer_values["provenance_json"][
+                                "processed_at"
+                            ],
+                            "last_reprocess_scene_id": scene_id,
+                            "last_reprocess_pipeline_version": "2.0.0",
+                        },
+                        type_=JSONB,
+                    )
+                ),
             },
         )
         .returning(RasterLayer.id)
@@ -591,12 +621,21 @@ def process_scene(
     session.commit()
     complete_step(session, job, "compute_stats")
 
-    # -- run alerts (skip for backfill jobs to avoid flooding) --
+    # -- run alerts (skip for backfill jobs to avoid flooding, and whenever
+    # the alert rules are disabled: indices are still stored above) --
     is_backfill = (job.params_json or {}).get("is_backfill", False)
     update_job_progress(session, job, "run_alerts")
     if stats["mean"] is not None:
         historical_means.append(stats["mean"])
-    if not is_backfill:
+    if not settings.openfarm_alert_rules_enabled:
+        logger.info(
+            "alert_rules_disabled",
+            job_id=str(job.id),
+            field_id=str(job.field_id),
+            index=index_key,
+            date=str(scene_date),
+        )
+    elif not is_backfill:
         run_alerts(
             session,
             job.field_id,

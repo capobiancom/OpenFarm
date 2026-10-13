@@ -38,15 +38,23 @@ celery_app.conf.update(
     task_routes={
         "app.tasks.detection.*": {"queue": "ml"},
     },
-    # Celery Beat schedule
+    # Celery Beat schedule. Times are UTC (explicit, not host-dependent).
+    # Beat runs as its own single-instance service (openfarm-scheduler in
+    # deploy/coolify/core), never embedded in a worker (-B). Each dispatch
+    # expires if no worker picks it up within 6 h, so a long worker outage
+    # does not replay stale dispatches.
+    timezone="UTC",
+    enable_utc=True,
     beat_schedule={
         "compute-indices-weekly": {
             "task": "app.tasks.backfill.schedule_weekly_index_compute",
             "schedule": crontab(hour=6, minute=0, day_of_week=1),
+            "options": {"expires": 6 * 3600},
         },
         "fetch-weather-daily": {
             "task": "app.tasks.weather.schedule_daily_weather_fetch",
             "schedule": crontab(hour=8, minute=0),
+            "options": {"expires": 6 * 3600},
         },
     },
 )

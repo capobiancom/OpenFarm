@@ -47,11 +47,27 @@ class Settings(BaseSettings):
     weather_batch_size: int = 50
     weather_gdd_base_temp: float = 10.0
     weather_heat_stress_threshold: float = 32.0
+    # Daily refresh: re-fetch from the last stored day (it may be partial)
+    # up to today, never further back than this many days.
+    weather_daily_max_gap_days: int = 30
 
     # Index Backfill
     index_backfill_months: int = 24
     index_backfill_chunk_days: int = 90
     index_weekly_batch_size: int = 50
+    # Weekly refresh: window starts the day after the latest stored scene,
+    # capped to this many days so a long-stale field never turns into a
+    # backfill.
+    index_weekly_max_window_days: int = 60
+    # A field with a pending/running job created within this many hours, or
+    # with a scheduled weekly job created within it, is not dispatched again.
+    scheduler_job_guard_hours: int = 24
+
+    # Alert rules (index threshold/drop and soil). Off unless explicitly
+    # enabled: the current rules produce false positives (see
+    # docs in deploy/coolify/README.md). Index and weather refresh never
+    # depend on this flag.
+    openfarm_alert_rules_enabled: bool = False
 
     # Soil Data
     soilgrids_wcs_base_url: str = "https://maps.isric.org/mapserv"

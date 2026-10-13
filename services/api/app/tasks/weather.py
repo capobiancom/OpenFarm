@@ -5,6 +5,7 @@ Daily polling + historical backfill via Celery Beat.
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -13,7 +14,7 @@ import httpx
 import structlog
 from celery import group
 from geoalchemy2.shape import to_shape
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.core.config import settings
@@ -196,8 +197,16 @@ def fetch_weather_for_field(
             end_date = today - timedelta(days=1)
             use_archive = True
         else:
-            start_date = today - timedelta(days=1)
-            end_date = today
+            # Daily refresh: from the last stored day (possibly partial) to
+            # today, filling days missed while the scheduler was off.
+            from app.tasks.scheduling import daily_weather_window
+
+            last_stored = session.execute(
+                select(func.max(WeatherDaily.date)).where(
+                    WeatherDaily.field_id == uuid.UUID(field_id)
+                )
+            ).scalar_one_or_none()
+            start_date, end_date = daily_weather_window(last_stored, today)
             use_archive = False
 
         logger.info(
@@ -219,12 +228,14 @@ def fetch_weather_for_field(
             logger.warning("weather_no_daily_data", field_id=field_id)
             return {"field_id": field_id, "rows_upserted": 0, "status": "no_data"}
 
-        # Get last known cumulative GDD for this field
+        # Cumulative GDD continues from the last day BEFORE the fetched window,
+        # so re-fetched days are not counted twice.
         last_gdd_row = session.execute(
             select(WeatherDaily.gdd_cumulative, WeatherDaily.date)
             .where(
                 WeatherDaily.field_id == uuid.UUID(field_id),
                 WeatherDaily.gdd_cumulative.isnot(None),
+                WeatherDaily.date < start_date,
             )
             .order_by(WeatherDaily.date.desc())
             .limit(1)
@@ -306,7 +317,8 @@ def fetch_weather_for_field(
             "weather_api_error",
             field_id=field_id,
             status=e.response.status_code,
-            detail=str(e),
+            url=_safe_url(e.request.url),
+            detail=_redact(e.response.text[:300]),
         )
         session.rollback()
         raise self.retry(exc=e, countdown=60 * (2**self.request.retries))
@@ -315,18 +327,28 @@ def fetch_weather_for_field(
         logger.error(
             "weather_fetch_error",
             field_id=field_id,
-            error=str(e),
-            exc_info=True,
+            error_type=type(e).__name__,
+            error=_redact(str(e)),
         )
         session.rollback()
         return {
             "field_id": field_id,
             "rows_upserted": 0,
             "status": "failed",
-            "error": str(e),
+            "error": f"{type(e).__name__}: {_redact(str(e))}",
         }
     finally:
         session.close()
+
+
+def _safe_url(url) -> str:
+    """Provider URL without its query string (it may carry an API key)."""
+    return str(url).split("?", 1)[0]
+
+
+def _redact(message: str) -> str:
+    """Remove API keys that providers or httpx may echo back in messages."""
+    return re.sub(r"(apikey|api_key|key)=[^&\s'\"]+", r"\1=***", message)
 
 
 def _update_water_balance(session, field_id: str) -> None:
@@ -374,17 +396,24 @@ def _update_water_balance(session, field_id: str) -> None:
 def schedule_daily_weather_fetch() -> dict:
     """Scheduled task (Celery Beat, 08:00 UTC).
 
-    Fetches weather for all active fields in batches.
+    Fetches weather for every eligible field (live field in a live org, see
+    ``app.tasks.scheduling``) in batches. Each per-field fetch is an upsert
+    of its own window, so a repeated dispatch never duplicates rows; the
+    advisory lock still prevents two dispatches from overlapping.
     """
-    from app.models.tables import Field
+    from app.tasks.scheduling import (
+        DAILY_WEATHER_LOCK_KEY,
+        eligible_fields,
+        try_lock,
+    )
 
     session = _get_db_session()
     try:
-        field_ids = (
-            session.execute(select(Field.id).where(Field.deleted_at.is_(None)))
-            .scalars()
-            .all()
-        )
+        if not try_lock(session, DAILY_WEATHER_LOCK_KEY):
+            logger.warning("weather_schedule_locked")
+            return {"status": "skipped", "reason": "another dispatch is running"}
+
+        field_ids = [f[0] for f in eligible_fields(session)]
 
         if not field_ids:
             logger.info("weather_schedule_no_fields")
@@ -397,7 +426,6 @@ def schedule_daily_weather_fetch() -> dict:
             task_group = group(fetch_weather_for_field.s(str(fid)) for fid in batch)
             batches.append(task_group)
 
-        # Execute batches sequentially to avoid API stampede
         for batch in batches:
             batch.apply_async()
 
@@ -409,6 +437,7 @@ def schedule_daily_weather_fetch() -> dict:
         return {"fields": len(field_ids), "batches": len(batches)}
 
     finally:
+        session.rollback()
         session.close()
 
 

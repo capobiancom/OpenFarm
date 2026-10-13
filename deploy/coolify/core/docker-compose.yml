@@ -113,6 +113,32 @@ services:
       retries: 3
       start_period: 60s
 
+  # Celery Beat: only publishes the periodic dispatches defined in
+  # app/worker.py (weekly indices Mon 06:00 UTC, daily weather 08:00 UTC);
+  # it consumes no tasks. Exactly one per environment: 0 = off (default, so
+  # enabling it is an explicit step), 1 = on. Never run `celery worker -B`.
+  # The schedule lives in code; the state file is disposable (a redeploy
+  # simply continues with the next due time, no catch-up replays).
+  openfarm-scheduler:
+    build:
+      context: ../../../services/api
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    mem_limit: 192m
+    command: celery -A app.worker beat --loglevel=info --schedule /tmp/celerybeat-schedule --pidfile=
+    deploy:
+      replicas: ${OPENFARM_SCHEDULER_REPLICAS:-0}
+    depends_on:
+      openfarm-redis: { condition: service_healthy }
+    networks:
+      openfarm: {}
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.scheduler_health", "/tmp/celerybeat-schedule", "900"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
 volumes:
   pgdata: {}
   redisdata: {}

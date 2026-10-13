@@ -203,100 +203,76 @@ def backfill_indices_for_field(
     soft_time_limit=240,
 )
 def schedule_weekly_index_compute(self) -> dict:
-    """Query all active fields, skip fresh ones, dispatch index jobs for stale ones.
+    """Dispatch one normal (non-backfill) job per index for each stale field.
 
-    A field is considered *stale* if its latest raster layer is older than 7 days.
+    Eligibility and windows come from ``app.tasks.scheduling``: live fields
+    in live orgs whose latest scene is older than 7 days; the window starts
+    after the latest stored scene and is capped, so stored dates are not
+    reprocessed and the run is never a backfill. Duplicate dispatches are
+    prevented by an advisory lock and by skipping fields with a job in
+    flight or already scheduled within ``scheduler_job_guard_hours``. Jobs
+    are committed before their Celery tasks are sent.
     """
-    from sqlalchemy import func as sqla_func
-
-    from app.models.tables import Field, Job, RasterLayer
+    from app.models.tables import Job
+    from app.tasks.scheduling import (
+        SCHEDULED_WEEKLY_TRIGGER,
+        WEEKLY_INDEX_LOCK_KEY,
+        plan_weekly_index_jobs,
+        try_lock,
+    )
 
     session = get_db_session()
-    batch_size = settings.index_weekly_batch_size
-    stale_threshold = date.today() - timedelta(days=7)
-
+    stagger_seconds = 15
     try:
-        # Fetch all active field IDs
-        field_rows = session.execute(
-            select(Field.id, Field.org_id, Field.created_by).where(
-                Field.deleted_at.is_(None)
-            )
-        ).all()
+        if not try_lock(session, WEEKLY_INDEX_LOCK_KEY):
+            logger.warning("weekly_index_compute_locked")
+            session.rollback()
+            return {"status": "skipped", "reason": "another dispatch is running"}
 
-        fields_checked = 0
-        fields_dispatched = 0
-        jobs_dispatched = 0
-        stagger_seconds = 15
-
-        for batch_start in range(0, len(field_rows), batch_size):
-            batch = field_rows[batch_start : batch_start + batch_size]
-
-            for field_id, org_id, created_by in batch:
-                fields_checked += 1
-
-                # Check staleness: latest raster layer date
-                latest_date = session.execute(
-                    select(sqla_func.max(RasterLayer.date)).where(
-                        RasterLayer.field_id == field_id
-                    )
-                ).scalar_one_or_none()
-
-                if latest_date is not None and latest_date > stale_threshold:
-                    continue  # fresh - skip
-
-                # Determine date range: latest_date+1 → today (or 7 days back if none)
-                date_from = (
-                    (latest_date + timedelta(days=1))
-                    if latest_date
-                    else (date.today() - timedelta(days=7))
-                )
-                date_to = date.today()
-                if date_from >= date_to:
+        plans = plan_weekly_index_jobs(session)
+        to_send: list[tuple[str, str, int]] = []
+        for field_idx, plan in enumerate(plans):
+            for idx_key in sorted(INDEX_REGISTRY.keys()):
+                task_name = INDEX_TASK_MAP.get(idx_key)
+                if not task_name:
                     continue
+                job = Job(
+                    org_id=plan.org_id,
+                    field_id=plan.field_id,
+                    type=idx_key,
+                    status="pending",
+                    params_json={
+                        "date_from": plan.date_from.isoformat(),
+                        "date_to": plan.date_to.isoformat(),
+                        "trigger": SCHEDULED_WEEKLY_TRIGGER,
+                    },
+                    created_by=plan.created_by,
+                )
+                session.add(job)
+                session.flush()
+                to_send.append((task_name, str(job.id), field_idx * stagger_seconds))
+            logger.info(
+                "weekly_index_field_scheduled",
+                field_id=str(plan.field_id),
+                latest_scene=str(plan.latest_scene),
+                date_from=plan.date_from.isoformat(),
+                date_to=plan.date_to.isoformat(),
+            )
 
-                # Dispatch one job per index
-                for idx_key in sorted(INDEX_REGISTRY.keys()):
-                    task_name = INDEX_TASK_MAP.get(idx_key)
-                    if not task_name:
-                        continue
-
-                    job = Job(
-                        org_id=org_id,
-                        field_id=field_id,
-                        type=idx_key,
-                        status="pending",
-                        params_json={
-                            "date_from": date_from.isoformat(),
-                            "date_to": date_to.isoformat(),
-                        },
-                        created_by=created_by,
-                    )
-                    session.add(job)
-                    session.flush()
-
-                    countdown = fields_dispatched * stagger_seconds
-                    celery_app.send_task(
-                        task_name,
-                        args=[str(job.id)],
-                        countdown=countdown,
-                    )
-                    jobs_dispatched += 1
-
-                fields_dispatched += 1
-
+        # Commit first: a worker must never receive a job id it cannot load.
         session.commit()
+        for task_name, job_id, countdown in to_send:
+            celery_app.send_task(task_name, args=[job_id], countdown=countdown)
 
         logger.info(
             "weekly_index_compute_complete",
-            fields_checked=fields_checked,
-            fields_dispatched=fields_dispatched,
-            jobs_dispatched=jobs_dispatched,
+            fields_dispatched=len(plans),
+            jobs_dispatched=len(to_send),
         )
         return {
             "status": "completed",
-            "fields_checked": fields_checked,
-            "fields_dispatched": fields_dispatched,
-            "jobs_dispatched": jobs_dispatched,
+            "fields_dispatched": len(plans),
+            "jobs_dispatched": len(to_send),
         }
 
     except Exception as e:

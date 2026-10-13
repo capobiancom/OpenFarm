@@ -1256,9 +1256,13 @@ def fetch_soil_for_field(self, field_id: str, job_id: str | None = None) -> dict
 
         session.commit()
 
-        # Step 4b: Evaluate soil alerts
+        # Step 4b: Evaluate soil alerts (only when the alert rules are enabled)
         try:
-            alert_candidates = evaluate_soil_alerts(summary_data, layer_dicts)
+            if not settings.openfarm_alert_rules_enabled:
+                logger.info("alert_rules_disabled", field_id=field_id, source="soil")
+                alert_candidates = []
+            else:
+                alert_candidates = evaluate_soil_alerts(summary_data, layer_dicts)
             today = datetime.now(timezone.utc).date()
             for candidate in alert_candidates:
                 alert = Alert(
