@@ -38,11 +38,63 @@ it does **not** mean the threshold is agronomically right. No threshold value wa
 
 ## Identity, re-runs and managed alerts
 
-* An alert is identified by `(field_id, rule_name, date)` — unique index `uq_alerts_field_rule_date`
-  (migration 0015). Inserts use `ON CONFLICT DO NOTHING`: reprocessing a scene, retries and concurrent
-  writers never duplicate it.
-* The **first** detection wins and is never overwritten: if a re-evaluation produces different numbers, or
-  no longer triggers, the existing alert (open or closed by a user) and its evidence are kept unchanged.
-  Status/assignment history is therefore never lost; a changed result is not reflected automatically.
-* Soil: a rule already raised for a field (open or closed) is not raised again on later soil refreshes.
-* Migration 0015 refuses to run (explicit error) if duplicated identities already exist; it never deletes.
+Policy (v2): **the first detection is kept**. A re-evaluation never overwrites the original evidence
+nor the management state of an existing alert, open or closed. A changed or vanished result is not
+reflected automatically.
+
+Enforced by the database (migration 0015), not only by the code:
+
+| Index | Columns | Applies to | Effect |
+|---|---|---|---|
+| `uq_alerts_field_rule_date` | `(field_id, rule_name, date)` | every rule | one alert per field, rule and observation date; index rules can fire again on a **new** date |
+| `uq_alerts_soil_field_rule` | `(field_id, rule_name) WHERE left(rule_name,5)='soil_'` | soil rules | one alert per field and soil rule, whatever the refresh date |
+
+* `alerts.date` is `NOT NULL` since migration 0001 and both writers always set it, so PostgreSQL's
+  default `NULLS DISTINCT` (PostgreSQL 16.4 in prod and dev) can never let a duplicate through; inserting a
+  NULL date is rejected (tested).
+* Writers use `INSERT … ON CONFLICT DO NOTHING` (soil: no conflict target, so either index applies). Plain
+  inserts that bypass it are rejected with `duplicate key value violates unique constraint`. Concurrent
+  writers cannot race past the indexes.
+* Historical alerts: 0015 changes no row. It refuses to run (explicit error, nothing deleted) if the table
+  already holds duplicates of either identity; prod and dev had 0 alerts on 2026-10-14.
+
+## Start-up, migrations and health
+
+* The API container runs `alembic upgrade head` before uvicorn (`services/api/Dockerfile` `CMD`): up to 10
+  attempts, 3 s apart. **If every attempt fails, uvicorn still starts** (the loop ends on a successful
+  `sleep`) and the API serves with the older schema. The logs only say `Waiting for DB... attempt N`; the
+  real cause is printed just above each line. Unchanged on purpose: failing the start would turn a refused
+  migration into an API crash loop (all reads used by AgroMind down) and the image is shared with the
+  upstream compose files.
+* `/healthz` now tells the truth: it answers **HTTP 503** when the database or Redis fails **or** when the
+  schema is behind the code (`schema: database at 0014; code requires 0015`); 200 with
+  `{"status":"ok","schema":"schema at 0015"}` otherwise. It used to answer 200 with `status: unhealthy`,
+  which the container healthcheck (`curl -f`) accepted. A schema *ahead* of the code (after a code
+  rollback) is reported but not a failure.
+* The processor/beat do not run migrations. With the schema behind, index/soil alert inserts would fail
+  (their `ON CONFLICT` needs the 0015 indexes) - only relevant if `OPENFARM_ALERT_RULES_ENABLED=true`, which
+  must therefore never be enabled while `/healthz` reports the schema behind.
+* Known, out of scope: with Redis unreachable `/healthz` answers 500 (the rate limiter fails before the
+  handler) - already non-2xx, so the healthcheck fails as it should.
+
+## Deploying migration 0015 (controlled procedure)
+
+1. Keep `OPENFARM_ALERT_RULES_ENABLED=false` (CORE and EDGE).
+2. Read-only pre-checks on the target database:
+   `SELECT version_num FROM alembic_version` (expect 0014);
+   `SELECT field_id, rule_name, date, count(*) FROM alerts GROUP BY 1,2,3 HAVING count(*)>1` (expect 0 rows);
+   `SELECT field_id, rule_name, count(*) FROM alerts WHERE left(rule_name,5)='soil_' GROUP BY 1,2 HAVING count(*)>1`
+   (expect 0 rows). Any row: stop, review the duplicates with the product owner; never delete blindly.
+3. Fresh `pg_dump -Fc` of the engine database.
+4. Deploy **EDGE first** (its API applies the migration), then CORE (processor + beat, same commit).
+5. Verify on EDGE: logs contain `Running upgrade 0014 -> 0015` and no `Waiting for DB`;
+   `docker exec <api> curl -s -w ' %{http_code}' localhost:8000/healthz` → `200 … schema at 0015`;
+   both `uq_alerts_*` indexes exist (`pg_indexes`). From the AgroMind backend: API and tiler via aliases 200.
+6. If `/healthz` answers 503 with `schema: …`: the migration did not apply. The API keeps serving reads with
+   the old schema (no outage for AgroMind); do not enable alerts; read the error above `Waiting for DB` in
+   the API logs, fix the cause, then restart the API container (it re-runs `alembic upgrade head`).
+7. Rollback: run `alembic downgrade 0014` from the new API container **before** deploying the previous
+   commit; it only drops the two indexes (no data change). Without the downgrade the previous code
+   (`7ea72e9`) still serves on a 0015 schema, but its start-up first fails 10 times
+   (`Can't locate revision identified by '0015'`, ~30 s) and its `/healthz` does not check the schema
+   (verified on the disposable database).

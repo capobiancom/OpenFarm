@@ -1312,10 +1312,10 @@ def _create_soil_alerts(session, field, summary_data: dict, layer_dicts: list[di
     """Insert soil alert candidates; returns how many were created.
 
     Soil properties are near-static, so a rule already raised for the field
-    (open or already managed) is not raised again on later soil refreshes;
-    the unique (field_id, rule_name, date) index also guards same-day races.
+    (open or already managed) is not raised again on later soil refreshes.
+    The database enforces it (unique partial index uq_alerts_soil_field_rule,
+    migration 0015): concurrent refreshes cannot race past it.
     """
-    from sqlalchemy import select as _select
     from sqlalchemy.dialects.postgresql import insert as _pg_insert
 
     from app.core.alert_rules import RULES_VERSION
@@ -1327,19 +1327,9 @@ def _create_soil_alerts(session, field, summary_data: dict, layer_dicts: list[di
     candidates = evaluate_soil_alerts(summary_data, layer_dicts)
     if not candidates:
         return 0
-    existing = set(
-        session.execute(
-            _select(Alert.rule_name).where(
-                Alert.field_id == field.id,
-                Alert.rule_name.in_([c.rule_name for c in candidates]),
-            )
-        ).scalars()
-    )
     today = datetime.now(timezone.utc).date()
     created = 0
     for candidate in candidates:
-        if candidate.rule_name in existing:
-            continue
         result = session.execute(
             _pg_insert(Alert)
             .values(
@@ -1359,7 +1349,9 @@ def _create_soil_alerts(session, field, summary_data: dict, layer_dicts: list[di
                 # measured value(s), threshold and depth as produced by the rule
                 soil_context=candidate.soil_context,
             )
-            .on_conflict_do_nothing(index_elements=["field_id", "rule_name", "date"])
+            # No conflict target: either identity index (per day, or per
+            # field for soil rules) turns a repeat into a no-op.
+            .on_conflict_do_nothing()
         )
         created += result.rowcount or 0
     session.commit()

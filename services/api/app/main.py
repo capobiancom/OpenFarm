@@ -98,16 +98,36 @@ app.include_router(soil.router, prefix=PREFIX, tags=["soil"])
 # ── Health Check ─────────────────────────────────────────────────────
 @app.get("/healthz", tags=["health"])
 async def healthz():
-    """Check DB connection and Redis ping."""
-    errors: list[str] = []
+    """DB connection, Redis ping and schema revision.
 
-    # DB check
+    Any failure answers HTTP 503 (it used to answer 200 with
+    ``status: unhealthy``, which the container healthcheck - ``curl -f`` -
+    always accepted). A database behind the code's migration head, e.g. a
+    failed ``alembic upgrade`` at start-up, is a failure: the API keeps
+    serving, but is not reported as healthy.
+    """
+    errors: list[str] = []
+    schema: str | None = None
+
+    # DB check + schema revision
     try:
         from sqlalchemy import text
         from app.core.database import engine
+        from app.core.schema_status import classify
 
         async with engine.connect() as conn:
             await conn.execute(text("SELECT 1"))
+            has_version = (
+                await conn.execute(text("SELECT to_regclass('alembic_version') IS NOT NULL"))
+            ).scalar()
+            revision = (
+                (await conn.execute(text("SELECT version_num FROM alembic_version"))).scalar()
+                if has_version
+                else None
+            )
+        state, schema = classify(revision)
+        if state == "behind":
+            errors.append(f"schema: {schema}")
     except Exception as e:
         errors.append(f"db: {e}")
 
@@ -120,5 +140,5 @@ async def healthz():
         errors.append(f"redis: {e}")
 
     if errors:
-        return {"status": "unhealthy", "errors": errors}
-    return {"status": "ok"}
+        return JSONResponse(status_code=503, content={"status": "unhealthy", "errors": errors})
+    return {"status": "ok", "schema": schema}

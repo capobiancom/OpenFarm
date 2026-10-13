@@ -256,9 +256,17 @@ class FieldStat(Base):
 
 class Alert(Base):
     __tablename__ = "alerts"
-    # One alert per (field, rule, observation date) - migration 0015.
+    # Alert identity - migration 0015: one per (field, rule, observation
+    # date); soil rules additionally once per (field, rule).
     __table_args__ = (
         Index("uq_alerts_field_rule_date", "field_id", "rule_name", "date", unique=True),
+        Index(
+            "uq_alerts_soil_field_rule",
+            "field_id",
+            "rule_name",
+            unique=True,
+            postgresql_where=text("left(rule_name, 5) = 'soil_'"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
