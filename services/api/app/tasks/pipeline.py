@@ -338,78 +338,59 @@ def run_alerts(
     org_id,
     scene_date: date,
     stats: dict,
-    historical_means: list[float],
+    history: list[tuple[date, float | None]],
     index_def: IndexDef,
-):
-    """Evaluate threshold and drop alert rules for any index type."""
+) -> int:
+    """Evaluate the index alert rules for one observation; returns alerts inserted.
+
+    ``history`` holds prior (date, mean) observations of the SAME index (see
+    app.core.alert_rules for how it is cleaned). Inserts are idempotent: an
+    alert is identified by (field_id, rule_name, date), enforced by the
+    unique index uq_alerts_field_rule_date, and an existing one - open or
+    already managed (closed) - is never duplicated or overwritten.
+    """
+    from app.core.alert_rules import evaluate_index_rules
     from app.models.tables import Alert
 
     if not settings.openfarm_alert_rules_enabled:
-        return
+        return 0
 
-    current_mean = stats.get("mean")
-    if current_mean is None:
-        return
+    candidates = evaluate_index_rules(index_def, scene_date, stats.get("mean"), history)
+    if not candidates:
+        return 0
 
-    # Fetch recent weather context for alert enrichment
+    # Fetch recent weather context for alert enrichment (None if absent)
     weather_ctx = _get_weather_context(session, field_id, scene_date)
 
-    alert_cfg = index_def.alerts
-    label = index_def.label
-
-    # threshold rule
-    if current_mean < alert_cfg.threshold:
-        severity = "high" if current_mean < alert_cfg.threshold_high else "medium"
-        session.add(
-            Alert(
+    inserted = 0
+    for c in candidates:
+        result = session.execute(
+            pg_insert(Alert)
+            .values(
                 org_id=org_id,
                 field_id=field_id,
-                date=scene_date,
-                severity=severity,
-                rule_name=f"{index_def.key}_threshold",
-                rule_params_json={"threshold": alert_cfg.threshold},
-                message=(
-                    f"{label} mean ({current_mean:.3f}) below threshold "
-                    f"({alert_cfg.threshold}). Consider scouting."
-                ),
+                date=c.observed_date,
+                severity=c.severity,
+                rule_name=c.rule_name,
+                rule_params_json=c.params,
+                message=c.message,
                 status="open",
-                index_type=index_def.key,
+                index_type=c.index_type,
                 weather_context=weather_ctx,
             )
+            .on_conflict_do_nothing(index_elements=["field_id", "rule_name", "date"])
         )
-
-    # drop rule
-    if len(historical_means) >= 2:
-        window = historical_means[-alert_cfg.drop_window :]
-        rolling_avg = sum(window) / len(window)
-        if rolling_avg > 0:
-            drop_pct = ((rolling_avg - current_mean) / rolling_avg) * 100
-            if drop_pct >= alert_cfg.drop_pct:
-                severity = (
-                    "high" if drop_pct >= 30 else "medium" if drop_pct >= 20 else "low"
-                )
-                session.add(
-                    Alert(
-                        org_id=org_id,
-                        field_id=field_id,
-                        date=scene_date,
-                        severity=severity,
-                        rule_name=f"{index_def.key}_drop",
-                        rule_params_json={
-                            "drop_pct": alert_cfg.drop_pct,
-                            "window": alert_cfg.drop_window,
-                        },
-                        message=(
-                            f"{label} dropped {drop_pct:.1f}% "
-                            f"(from avg {rolling_avg:.3f} to {current_mean:.3f}). "
-                            f"Investigate crop stress."
-                        ),
-                        status="open",
-                        index_type=index_def.key,
-                        weather_context=weather_ctx,
-                    )
-                )
+        inserted += result.rowcount or 0
     session.commit()
+    logger.info(
+        "alerts_evaluated",
+        field_id=str(field_id),
+        index=index_def.key,
+        date=str(scene_date),
+        candidates=[c.rule_name for c in candidates],
+        inserted=inserted,
+    )
+    return inserted
 
 
 # ── Grid / mask helpers ──────────────────────────────────────────────
@@ -461,7 +442,7 @@ def process_scene(
     field_id_str: str,
     date_from: date,
     date_to: date,
-    historical_means: list[float],
+    historical_means: list[tuple[date, float | None]],
     extra_params: dict | None = None,
 ):
     """Download bands, compute index, write COG, stats, alerts for one scene.
@@ -625,8 +606,11 @@ def process_scene(
     # the alert rules are disabled: indices are still stored above) --
     is_backfill = (job.params_json or {}).get("is_backfill", False)
     update_job_progress(session, job, "run_alerts")
+    # The rules read only observations dated before this scene; it joins the
+    # history afterwards so later scenes of the same job can use it.
+    history_before = list(historical_means)
     if stats["mean"] is not None:
-        historical_means.append(stats["mean"])
+        historical_means.append((scene_date, stats["mean"]))
     if not settings.openfarm_alert_rules_enabled:
         logger.info(
             "alert_rules_disabled",
@@ -642,7 +626,7 @@ def process_scene(
             job.org_id,
             scene_date,
             stats,
-            historical_means,
+            history_before,
             index_def,
         )
     complete_step(session, job, "run_alerts")

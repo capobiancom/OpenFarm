@@ -41,7 +41,7 @@ logger = structlog.get_logger()
 )
 def process_ndvi(self, job_id: str) -> dict:
     """Process NDVI for a field - delegates to the shared pipeline."""
-    from app.models.tables import Job, Field, FieldStat
+    from app.models.tables import Job, Field, FieldStat, RasterLayer
 
     index_def = get_index("ndvi")
     session = get_db_session()
@@ -95,17 +95,21 @@ def process_ndvi(self, job_id: str) -> dict:
             field_geom.bounds, field_geom
         )
 
-        # Historical means for alerts
-        existing_stats = (
-            session.execute(
-                select(FieldStat.mean)
-                .where(FieldStat.field_id == job.field_id)
-                .order_by(FieldStat.date.asc())
-            )
-            .scalars()
-            .all()
-        )
-        historical_means = [float(m) for m in existing_stats if m is not None]
+        # Prior observations of THIS index only, for the drop rule. Ordered
+        # deterministically; the rule itself keeps only dates before each
+        # evaluated scene (app.core.alert_rules.clean_history).
+        historical_means = [
+            (d, float(m) if m is not None else None)
+            for d, m in session.execute(
+                select(FieldStat.date, FieldStat.mean)
+                .join(RasterLayer, RasterLayer.id == FieldStat.layer_id)
+                .where(
+                    FieldStat.field_id == job.field_id,
+                    RasterLayer.layer_type == index_def.label,
+                )
+                .order_by(FieldStat.date.asc(), FieldStat.id.asc())
+            ).all()
+        ]
 
         layers_created = 0
 

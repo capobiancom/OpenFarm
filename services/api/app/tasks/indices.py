@@ -49,10 +49,17 @@ def _ndwi(bands: dict[str, np.ndarray], **_kw) -> np.ndarray:
 
 @dataclass(frozen=True)
 class AlertDefaults:
-    threshold: float
-    threshold_high: float  # below this → high severity (else medium)
-    drop_pct: float
-    drop_window: int = 4
+    """Rule parameters for one index (the evaluation logic lives in
+    app/core/alert_rules.py). ``None`` = rule not configured for this index:
+    it is never evaluated. None of these values is calibrated per crop,
+    region or phenological stage - see deploy/coolify/alert-rules.md.
+    """
+
+    threshold: float | None  # alert when the scene mean is below this
+    threshold_high: float | None  # below this → high severity (else medium)
+    drop_pct: float | None  # alert when the mean drops this % vs. reference
+    drop_window: int = 4  # prior observations of the SAME index averaged
+    calibration: str = "uncalibrated"
 
 
 # ── Index definition ─────────────────────────────────────────────────
@@ -139,7 +146,17 @@ _register(
         formula=_ndwi,
         colormap="rdbu",
         rescale=(-1.0, 1.0),
-        alerts=AlertDefaults(threshold=0.0, threshold_high=-0.2, drop_pct=20),
+        # McFeeters NDWI (green - NIR) measures open water: it is negative
+        # over vegetation and bare soil by construction, so a 0 threshold
+        # flagged every cultivated field, and a % drop is meaningless around
+        # or below zero. No crop water-stress rule is defined for it until a
+        # validated one exists (that would need NDMI/SWIR, not this index).
+        alerts=AlertDefaults(
+            threshold=None,
+            threshold_high=None,
+            drop_pct=None,
+            calibration="not configured: McFeeters NDWI is an open-water index",
+        ),
         stac_asset_map={
             "B03": ("green", "B03"),
             "B08": ("nir", "B08"),

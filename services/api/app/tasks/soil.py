@@ -1258,40 +1258,14 @@ def fetch_soil_for_field(self, field_id: str, job_id: str | None = None) -> dict
 
         # Step 4b: Evaluate soil alerts (only when the alert rules are enabled)
         try:
-            if not settings.openfarm_alert_rules_enabled:
-                logger.info("alert_rules_disabled", field_id=field_id, source="soil")
-                alert_candidates = []
-            else:
-                alert_candidates = evaluate_soil_alerts(summary_data, layer_dicts)
-            today = datetime.now(timezone.utc).date()
-            for candidate in alert_candidates:
-                alert = Alert(
-                    field_id=field.id,
-                    org_id=field.org_id,
-                    date=today,
-                    severity=candidate.severity,
-                    rule_name=candidate.rule_name,
-                    rule_params_json=candidate.rule_params,
-                    message=candidate.message,
-                    status="open",
-                    soil_context={
-                        "trigger_value": candidate.trigger_value,
-                        "threshold": candidate.threshold,
-                        "layer_depth": candidate.layer_depth,
-                    },
-                )
-                session.add(alert)
-            if alert_candidates:
-                session.commit()
-                logger.info(
-                    "soil_alerts_created",
-                    field_id=field_id,
-                    count=len(alert_candidates),
-                )
+            created = _create_soil_alerts(session, field, summary_data, layer_dicts)
+            if created:
+                logger.info("soil_alerts_created", field_id=field_id, count=created)
         except Exception:
-            logger.warning(
-                "soil_alert_evaluation_failed", field_id=field_id, exc_info=True
-            )
+            # The soil profile above is already stored; a failure here must be
+            # visible (error + traceback) but must not lose that data.
+            session.rollback()
+            logger.exception("soil_alert_evaluation_failed", field_id=field_id)
 
         # Step 5: Complete
         _update_soil_job(session, job, "compute_summary", "completed")
@@ -1332,3 +1306,61 @@ def fetch_soil_for_field(self, field_id: str, job_id: str | None = None) -> dict
         raise self.retry(exc=exc, countdown=60)
     finally:
         session.close()
+
+
+def _create_soil_alerts(session, field, summary_data: dict, layer_dicts: list[dict]) -> int:
+    """Insert soil alert candidates; returns how many were created.
+
+    Soil properties are near-static, so a rule already raised for the field
+    (open or already managed) is not raised again on later soil refreshes;
+    the unique (field_id, rule_name, date) index also guards same-day races.
+    """
+    from sqlalchemy import select as _select
+    from sqlalchemy.dialects.postgresql import insert as _pg_insert
+
+    from app.core.alert_rules import RULES_VERSION
+
+    if not settings.openfarm_alert_rules_enabled:
+        logger.info("alert_rules_disabled", field_id=str(field.id), source="soil")
+        return 0
+
+    candidates = evaluate_soil_alerts(summary_data, layer_dicts)
+    if not candidates:
+        return 0
+    existing = set(
+        session.execute(
+            _select(Alert.rule_name).where(
+                Alert.field_id == field.id,
+                Alert.rule_name.in_([c.rule_name for c in candidates]),
+            )
+        ).scalars()
+    )
+    today = datetime.now(timezone.utc).date()
+    created = 0
+    for candidate in candidates:
+        if candidate.rule_name in existing:
+            continue
+        result = session.execute(
+            _pg_insert(Alert)
+            .values(
+                field_id=field.id,
+                org_id=field.org_id,
+                date=today,
+                severity=candidate.severity,
+                rule_name=candidate.rule_name,
+                rule_params_json={
+                    "rules_version": RULES_VERSION,
+                    "threshold": candidate.soil_context.get("threshold"),
+                    "calibration": "uncalibrated",
+                },
+                message=candidate.message,
+                status="open",
+                index_type=None,
+                # measured value(s), threshold and depth as produced by the rule
+                soil_context=candidate.soil_context,
+            )
+            .on_conflict_do_nothing(index_elements=["field_id", "rule_name", "date"])
+        )
+        created += result.rowcount or 0
+    session.commit()
+    return created

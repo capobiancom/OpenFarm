@@ -36,5 +36,6 @@ Two Coolify Docker Compose resources, both built from this fork, branch `deploy/
     `OPENFARM_SCHEDULER_REPLICAS=0` + redeploy CORE. Recover: redeploy CORE (state file is disposable; no
     catch-up of missed runs).
 - **Alerts.** `OPENFARM_ALERT_RULES_ENABLED=false` (runtime, CORE and EDGE) disables the index and soil alert
-  rules; processing still stores indices and weather. Keep it false until the rules are fixed.
+  rules; processing still stores indices and weather. Keep it false: rule status, semantics and what still
+  needs agronomic calibration are in [alert-rules.md](alert-rules.md).
 - Deploy manually (auto-deploy off, no webhook). Order: CORE → EDGE → AgroMind backend → frontend.

@@ -256,6 +256,10 @@ class FieldStat(Base):
 
 class Alert(Base):
     __tablename__ = "alerts"
+    # One alert per (field, rule, observation date) - migration 0015.
+    __table_args__ = (
+        Index("uq_alerts_field_rule_date", "field_id", "rule_name", "date", unique=True),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, server_default=text("uuid_generate_v4()")

@@ -27,117 +27,9 @@ pytestmark = pytest.mark.skipif(
 
 from sqlalchemy import delete, func, select, text  # noqa: E402
 
-TODAY = datetime.now(timezone.utc).date()
-GEOM = (
-    "SRID=4326;POLYGON((-62.760 -17.640,-62.750 -17.640,"
-    "-62.750 -17.650,-62.760 -17.650,-62.760 -17.640))"
-)
+from conftest import TODAY, fake_scene as _fake_scene, run_index_job  # noqa: E402
+
 REPO = Path(__file__).resolve().parents[3]
-
-
-# ── fixtures ─────────────────────────────────────────────────────────
-
-
-@pytest.fixture()
-def db():
-    from app.core.database_sync import SyncSession
-    from app.models import tables as t
-
-    s = SyncSession()
-    for model in (t.Alert, t.FieldStat, t.RasterLayer, t.WeatherDaily, t.Job, t.Field, t.Farm):
-        s.execute(delete(model))
-    s.execute(delete(t.OrgMember)) if hasattr(t, "OrgMember") else None
-    s.execute(delete(t.Org))
-    s.execute(delete(t.User))
-    s.commit()
-    yield s
-    s.rollback()
-    s.close()
-
-
-@pytest.fixture()
-def world(db):
-    """One user/org/farm and a helper to add fields with scene history."""
-    from app.models.tables import Farm, Field, Org, RasterLayer, FieldStat, User
-
-    user = User(email=f"svc-{uuid.uuid4().hex[:6]}@test.local", name="svc")
-    db.add(user)
-    db.flush()
-    org = Org(name="org", created_by=user.id)
-    db.add(org)
-    db.flush()
-    farm = Farm(org_id=org.id, name="farm")
-    db.add(farm)
-    db.flush()
-
-    def add_field(name, latest=None, deleted=False, in_org=None, backfill_meta=False):
-        o = in_org or org
-        f = Field(
-            org_id=o.id,
-            farm_id=farm.id if o is org else _farm_for(o),
-            name=name,
-            created_by=user.id,
-            geom=GEOM,
-            deleted_at=datetime.now(timezone.utc) if deleted else None,
-        )
-        db.add(f)
-        db.flush()
-        if latest:
-            for label in ("NDVI", "EVI", "SAVI", "NDWI"):
-                layer = RasterLayer(
-                    org_id=o.id,
-                    field_id=f.id,
-                    layer_type=label,
-                    date=latest,
-                    cog_uri=f"s3://openfarm/cogs/{o.id}/{f.id}/{latest}/{label.lower()}.tif",
-                    params_json=(
-                        {"date_from": "2026-01-01", "date_to": "2026-03-31", "is_backfill": True}
-                        if backfill_meta
-                        else {"date_from": str(latest), "date_to": str(latest)}
-                    ),
-                    provenance_json={"scene_id": "ORIG", "processed_at": "2026-01-02T00:00:00+00:00"},
-                )
-                db.add(layer)
-                db.flush()
-                db.add(FieldStat(org_id=o.id, field_id=f.id, layer_id=layer.id, date=latest, mean=0.5))
-        db.commit()
-        return f
-
-    def _farm_for(o):
-        fm = Farm(org_id=o.id, name="other")
-        db.add(fm)
-        db.flush()
-        return fm.id
-
-    def new_org(deleted=False):
-        o = Org(name="other-org", created_by=user.id,
-                deleted_at=datetime.now(timezone.utc) if deleted else None)
-        db.add(o)
-        db.commit()
-        return o
-
-    return {"user": user, "org": org, "farm": farm, "add_field": add_field, "new_org": new_org}
-
-
-@pytest.fixture()
-def sent(monkeypatch):
-    """Capture Celery dispatches; assert each job is already committed."""
-    from app.core.database_sync import SyncSession
-    from app.models.tables import Job
-    from app.worker import celery_app
-
-    calls = []
-
-    def fake_send_task(name, args=None, countdown=None, **kw):
-        probe = SyncSession()
-        try:
-            assert probe.get(Job, uuid.UUID(args[0])) is not None, "job sent before commit"
-        finally:
-            probe.close()
-        calls.append((name, args[0], countdown))
-
-    monkeypatch.setattr(celery_app, "send_task", fake_send_task)
-    return calls
 
 
 # ── Beat schedule, compose and configuration ─────────────────────────
@@ -315,48 +207,8 @@ def test_weekly_dispatch_respects_advisory_lock(db, world, sent):
 # ── Pipeline: alerts off, no scenes, reprocessing ────────────────────
 
 
-def _fake_scene(day):
-    return {
-        "id": f"S2X_TEST_{day:%Y%m%d}",
-        "date": day,
-        "cloud_cover": 1.0,
-        "band_hrefs": {"B03": "https://example/B03.tif", "B08": "https://example/B08.tif"},
-    }
-
-
-@pytest.fixture()
-def fake_sentinel(monkeypatch):
-    """No network: fixed scenes, bands with NDWI ~ -0.5, COG write skipped."""
-    import app.tasks.pipeline as pipeline
-    import app.tasks.vegetation as vegetation
-
-    scenes: list[dict] = []
-    monkeypatch.setattr(vegetation, "search_scenes", lambda *a, **k: list(scenes))
-
-    def fake_band(href, bounds, target_shape, target_transform):
-        value = 0.1 if href.endswith("B03.tif") else 0.3
-        return np.full(target_shape, value, dtype="float32")
-
-    monkeypatch.setattr(pipeline, "read_band_windowed", fake_band)
-    monkeypatch.setattr(
-        pipeline, "write_cog",
-        lambda data, tr, crs, org, field, d, key: f"s3://openfarm/cogs/{org}/{field}/{d}/{key}.tif",
-    )
-    return scenes
-
-
 def _run_ndwi_job(db, field, user, date_from, date_to, extra=None):
-    from app.models.tables import Job
-    from app.tasks.vegetation import process_ndwi
-
-    job = Job(org_id=field.org_id, field_id=field.id, type="ndwi", status="pending",
-              params_json={"date_from": str(date_from), "date_to": str(date_to), **(extra or {})},
-              created_by=user.id)
-    db.add(job)
-    db.commit()
-    result = process_ndwi(str(job.id))
-    db.expire_all()
-    return db.get(Job, job.id), result
+    return run_index_job(db, field, user, "ndwi", date_from, date_to, extra)
 
 
 def test_normal_processing_creates_no_alerts_when_rules_disabled(db, world, fake_sentinel, monkeypatch):
@@ -380,14 +232,18 @@ def test_normal_processing_creates_no_alerts_when_rules_disabled(db, world, fake
 
 
 def test_same_run_creates_alerts_only_if_rules_enabled(db, world, fake_sentinel, monkeypatch):
-    """Control: proves the flag (not the data) is what suppresses alerts."""
+    """Control: proves the flag (not the data) is what suppresses alerts.
+
+    NDVI ~0 is below the configured NDVI threshold; NDWI has no configured
+    rule any more (see deploy/coolify/alert-rules.md), so the control uses NDVI.
+    """
     from app.core.config import settings
     from app.models.tables import Alert
 
     monkeypatch.setattr(settings, "openfarm_alert_rules_enabled", True)
     f = world["add_field"]("lot", latest=TODAY - timedelta(days=20))
-    fake_sentinel.append(_fake_scene(TODAY - timedelta(days=5)))
-    _run_ndwi_job(db, f, world["user"], TODAY - timedelta(days=19), TODAY)
+    fake_sentinel.append(_fake_scene(TODAY - timedelta(days=5), {"B04": 0.3, "B08": 0.3}))
+    run_index_job(db, f, world["user"], "ndvi", TODAY - timedelta(days=19), TODAY)
     assert db.execute(select(func.count()).select_from(Alert)).scalar() > 0
 
 
