@@ -17,6 +17,8 @@ class FarmCreate(BaseModel):
     country: str | None = None
     region: str | None = None
     timezone: str | None = None
+    # AgroMind integration: client-supplied id for idempotent provisioning.
+    id: uuid.UUID | None = None
 
 
 class FarmUpdate(BaseModel):

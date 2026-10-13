@@ -13,7 +13,7 @@ import pytest
 from pydantic import ValidationError
 
 from app.schemas.auth import OrgCreate
-from app.schemas.farm import FieldCreate
+from app.schemas.farm import FarmCreate, FieldCreate
 
 GEOM = {
     "type": "Polygon",
@@ -50,3 +50,9 @@ def test_org_create_accepts_optional_client_id():
     assert OrgCreate(name="org").id is None
     oid = uuid.uuid4()
     assert OrgCreate(name="org", id=oid).id == oid
+
+
+def test_farm_create_accepts_optional_client_id():
+    assert FarmCreate(name="finca").id is None
+    fid = uuid.uuid4()
+    assert FarmCreate(name="finca", id=fid).id == fid

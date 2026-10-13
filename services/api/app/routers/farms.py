@@ -52,6 +52,15 @@ async def create_farm(
     ctx: Annotated[OrgContext, Depends(_writer)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
+    # Idempotent create (AgroMind integration): a client-supplied id that
+    # already exists returns the existing farm instead of duplicating it.
+    if body.id is not None:
+        existing = await db.get(Farm, body.id)
+        if existing is not None:
+            if existing.org_id != ctx.org_id:
+                raise HTTPException(status_code=409, detail="Farm id already exists")
+            return existing
+
     farm = Farm(
         org_id=ctx.org_id,
         name=body.name,
@@ -59,6 +68,8 @@ async def create_farm(
         region=body.region,
         timezone=body.timezone,
     )
+    if body.id is not None:
+        farm.id = body.id
     db.add(farm)
     await db.flush()
     logger.info(
