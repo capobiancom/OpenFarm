@@ -1,0 +1,128 @@
+# OpenFarm CORE for AgroMind — Coolify Docker Compose resource #1 of 2.
+# PostGIS, Redis, MinIO and the Celery processor. Never joins Coolify's
+# shared `coolify` network: its only declared network is the dedicated
+# ${OPENFARM_CORE_NETWORK}, shared with the EDGE resource (api + tiler).
+#
+# Coolify settings (see runbook capobiancom/OpenFarm-Deploy):
+#   build pack: Docker Compose · branch: deploy/coolify
+#   base directory: /deploy/coolify/core · compose file: /docker-compose.yml
+#   (the base directory becomes the compose project directory, so the
+#   ../../../services build context resolves to this repository's services/)
+#
+# How Coolify 4.0.0-beta.455 wires it (verified in its code and in M1):
+# - Every top-level network is added to EVERY service of the resource, plus
+#   Coolify's own per-resource network (named after the resource uuid), to
+#   which it periodically connects `coolify-proxy`. External networks
+#   declared here are NOT connected to the proxy.
+# - Named volumes are renamed to <resource-uuid>_<name>; `external: true` is
+#   ignored. A new resource starts EMPTY: copy the data into those volumes
+#   before the first start.
+# - The resource's whole `.env` is injected into every service (env_file).
+#   Secrets are therefore NOT interpolated here: they reach the containers
+#   through that `.env` and must be configured in Coolify as runtime-only
+#   variables, so they never become build arguments.
+# - Only variables interpolated below must be "available at build time" in
+#   Coolify: OPENFARM_CORE_NETWORK, OPENFARM_PROCESSOR_REPLICAS and the
+#   optional non-secret settings with defaults.
+#
+# Service names are unique (openfarm-*): Compose adds each service name as a
+# DNS alias on every network the service joins.
+# No service publishes ports.
+
+services:
+  openfarm-db:
+    image: postgis/postgis:16-3.4
+    restart: unless-stopped
+    mem_limit: 768m
+    # POSTGRES_USER / POSTGRES_PASSWORD / POSTGRES_DB come from the injected .env.
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      openfarm: {}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+
+  openfarm-redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    mem_limit: 128m
+    # maxmemory below the container limit: with noeviction Redis answers OOM
+    # errors instead of being killed by the kernel.
+    command: redis-server --appendonly yes --appendfsync everysec --maxmemory 100mb --maxmemory-policy noeviction
+    volumes:
+      - redisdata:/data
+    networks:
+      openfarm: {}
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  openfarm-minio:
+    image: ghcr.io/coollabsio/minio:RELEASE.2025-10-15T17-29-55Z
+    restart: unless-stopped
+    mem_limit: 384m
+    command: server /data
+    # MINIO_ROOT_USER / MINIO_ROOT_PASSWORD come from the injected .env.
+    volumes:
+      - miniodata:/data
+    networks:
+      openfarm: {}
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  openfarm-processor:
+    build:
+      context: ../../../services/api
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    mem_limit: 768m
+    command: celery -A app.worker worker -Q default,celery --loglevel=info --concurrency=2
+    # 1 in production. 0 keeps the worker from being created at all
+    # (rehearsals, maintenance windows) — verified with Docker Compose 5.0.0.
+    deploy:
+      replicas: ${OPENFARM_PROCESSOR_REPLICAS:-1}
+    # DATABASE_URL(_SYNC), REDIS_URL, MINIO_* come from the injected .env.
+    # Non-secret settings: real operational values as defaults. An empty
+    # value in Coolify counts as unset here, so a blank variable can never
+    # reach the app (an empty integer crashes its settings on boot).
+    environment:
+      STAC_API_URL: ${STAC_API_URL:-https://earth-search.aws.element84.com/v1}
+      SOILGRIDS_WCS_BASE_URL: ${SOILGRIDS_WCS_BASE_URL:-https://maps.isric.org/mapserv?map=/map}
+      SOIL_FETCH_TIMEOUT_SECONDS: ${SOIL_FETCH_TIMEOUT_SECONDS:-60}
+      SOIL_SOURCE_PRIORITY: ${SOIL_SOURCE_PRIORITY:-soilgrids}
+      POLARIS_S3_BUCKET: ${POLARIS_S3_BUCKET:-}
+      TITILER_INTERNAL_URL: http://openfarm-tiler:80
+    depends_on:
+      openfarm-db: { condition: service_healthy }
+      openfarm-redis: { condition: service_healthy }
+    networks:
+      openfarm: {}
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.worker inspect ping -d celery@$$HOSTNAME --timeout 10 | grep -q pong"]
+      interval: 60s
+      timeout: 20s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  pgdata: {}
+  redisdata: {}
+  miniodata: {}
+
+networks:
+  # Dedicated to OpenFarm (CORE + EDGE). Created beforehand, NOT --internal in
+  # production: the processor downloads Sentinel-2 bands and queries STAC,
+  # Open-Meteo and SoilGrids. It publishes nothing and only these two
+  # resources join it.
+  openfarm:
+    external: true
+    name: ${OPENFARM_CORE_NETWORK:?required}

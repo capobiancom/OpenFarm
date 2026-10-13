@@ -1,0 +1,86 @@
+# OpenFarm EDGE for AgroMind — Coolify Docker Compose resource #2 of 2.
+# Only the API and TiTiler. They reach the CORE services (openfarm-db,
+# openfarm-redis, openfarm-minio) over the dedicated ${OPENFARM_CORE_NETWORK}
+# and are reached by the AgroMind backend over ${OPENFARM_BACKEND_NETWORK}
+# (Coolify's `coolify` network in production), where they carry stable,
+# environment-specific aliases.
+#
+# Coolify settings (see runbook capobiancom/OpenFarm-Deploy):
+#   build pack: Docker Compose · branch: deploy/coolify
+#   base directory: /deploy/coolify/edge · compose file: /docker-compose.yml
+#
+# Coolify adds every top-level network to every service: both api and tiler
+# join both networks. That is intended — this resource contains nothing else.
+# Secrets are not interpolated here; they come from the injected `.env`
+# (runtime-only variables in Coolify). Only OPENFARM_CORE_NETWORK,
+# OPENFARM_BACKEND_NETWORK, OPENFARM_NETWORK_ALIAS and the optional non-secret
+# settings below must be available at build time.
+#
+# Deploy CORE first: the api runs `alembic upgrade head` against openfarm-db
+# on boot (no-op when the copied database is already at head).
+# No service publishes ports; both endpoints keep their JWT authentication.
+
+services:
+  openfarm-api:
+    build:
+      context: ../../../services/api
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    mem_limit: 512m
+    # DATABASE_URL(_SYNC), REDIS_URL, OPENFARM_JWT_SECRET, MINIO_* come from
+    # the injected .env.
+    environment:
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost}
+      TITILER_PUBLIC_URL: ${TITILER_PUBLIC_URL:-http://tiler}
+      TITILER_INTERNAL_URL: http://openfarm-tiler:80
+      STAC_API_URL: ${STAC_API_URL:-https://earth-search.aws.element84.com/v1}
+      SOILGRIDS_WCS_BASE_URL: ${SOILGRIDS_WCS_BASE_URL:-https://maps.isric.org/mapserv?map=/map}
+      SOIL_FETCH_TIMEOUT_SECONDS: ${SOIL_FETCH_TIMEOUT_SECONDS:-60}
+      SOIL_SOURCE_PRIORITY: ${SOIL_SOURCE_PRIORITY:-soilgrids}
+      POLARIS_S3_BUCKET: ${POLARIS_S3_BUCKET:-}
+    networks:
+      openfarm: {}
+      backend:
+        aliases: ["${OPENFARM_NETWORK_ALIAS:?required}-api"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  openfarm-tiler:
+    build:
+      context: ../../../services/tiler
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    mem_limit: 384m
+    # OPENFARM_JWT_SECRET, AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (the
+    # MinIO credentials) come from the injected .env.
+    environment:
+      AWS_S3_ENDPOINT: ${MINIO_ENDPOINT:-openfarm-minio:9000}
+      AWS_VIRTUAL_HOSTING: "FALSE"
+      AWS_HTTPS: "NO"
+      GDAL_DISABLE_READDIR_ON_OPEN: EMPTY_DIR
+      TITILER_API_CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost}
+    networks:
+      openfarm: {}
+      backend:
+        aliases: ["${OPENFARM_NETWORK_ALIAS:?required}-tiler"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+networks:
+  openfarm:
+    external: true
+    name: ${OPENFARM_CORE_NETWORK:?required}
+  # Where the AgroMind backend lives. Production: `coolify` (the backend is a
+  # Coolify Dockerfile app and cannot join other networks). Only this EDGE
+  # resource may join it; never declare it in CORE.
+  backend:
+    external: true
+    name: ${OPENFARM_BACKEND_NETWORK:?required}
