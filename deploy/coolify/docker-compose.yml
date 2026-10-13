@@ -4,26 +4,32 @@
 #
 # Runbook: capobiancom/OpenFarm-Deploy (README). Variables: .env.example here.
 #
-# Persistence: Coolify renames every named volume to "<resource-uuid>_<name>"
-# (bootstrap/helpers/parsers.php in Coolify 4.0.0-beta.455) and ignores
-# `external: true` on volumes. A new resource therefore starts with EMPTY
-# volumes. Existing data must be copied into <uuid>_pgdata / _redisdata /
-# _miniodata while the resource is stopped, BEFORE the first start, because the
-# api runs `alembic upgrade head` on boot and would silently initialise an
-# empty database.
+# Networks — how Coolify 4.0.0-beta.455 actually wires them
+# (bootstrap/helpers/parsers.php, applicationParser and serviceParser):
+# - It adds EVERY top-level network except `default` to EVERY service, whether
+#   the service declares it or not. A network cannot be limited to some
+#   services: all six services below WILL join ${OPENFARM_SHARED_NETWORK}.
+#   That network must therefore be dedicated to OpenFarm (+ the AgroMind
+#   backend in production), never a network shared with other tenants such
+#   as Coolify's global `coolify` network.
+# - It also adds its own per-resource network, named after the resource uuid,
+#   to every service. ApplicationDeploymentJob creates it only if it does not
+#   exist (`docker network create --attachable <uuid>`) and then connects
+#   `coolify-proxy` to it.
+# - This compose does not use the compose `default` network, so the only
+#   networks are ${OPENFARM_SHARED_NETWORK} and Coolify's per-resource one.
+#   Internal hostnames (openfarm-db, openfarm-redis, openfarm-minio) and the
+#   api/tiler aliases are declared on the shared network; they are unique so
+#   they cannot collide with short names like `redis` used elsewhere.
 #
-# Networking:
-# - `default` is the resource's private network. db, redis, minio and the
-#   processor live only there.
-# - Internal hostnames are unique (openfarm-db, openfarm-redis, openfarm-minio):
-#   api and tiler also join the shared `coolify` network, where short names like
-#   `redis` already resolve to other containers (Coolify's own Redis).
-# - api and tiler join the external `coolify` network with stable aliases
-#   (${OPENFARM_NETWORK_ALIAS}-api / -tiler) so the AgroMind backend, which can
-#   only live on `coolify`, reaches them after any redeploy of either side.
-#   Whether Coolify preserves this external network exactly as declared is
-#   still UNVERIFIED and must be confirmed in the isolated rehearsal (phase M1).
-# - No service publishes ports.
+# Persistence: Coolify renames every named volume to "<resource-uuid>_<name>"
+# and ignores `external: true` on volumes. A new resource therefore starts with
+# EMPTY volumes. Existing data must be copied into <uuid>_pgdata / _redisdata /
+# _miniodata BEFORE the first start, because the api runs
+# `alembic upgrade head` on boot and would silently initialise an empty
+# database.
+#
+# No service publishes ports.
 
 services:
   db:
@@ -37,7 +43,7 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
     networks:
-      default:
+      shared:
         aliases: [openfarm-db]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
@@ -56,7 +62,7 @@ services:
     volumes:
       - redisdata:/data
     networks:
-      default:
+      shared:
         aliases: [openfarm-redis]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -75,7 +81,7 @@ services:
     volumes:
       - miniodata:/data
     networks:
-      default:
+      shared:
         aliases: [openfarm-minio]
     healthcheck:
       test: ["CMD", "mc", "ready", "local"]
@@ -107,8 +113,7 @@ services:
       db: { condition: service_healthy }
       redis: { condition: service_healthy }
     networks:
-      default: {}
-      coolify:
+      shared:
         aliases: ["${OPENFARM_NETWORK_ALIAS:?required}-api"]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"]
@@ -124,6 +129,10 @@ services:
     restart: unless-stopped
     mem_limit: 768m
     command: celery -A app.worker worker -Q default,celery --loglevel=info --concurrency=2
+    # 1 in normal operation. 0 keeps the worker from being created at all
+    # (isolated rehearsals, or a maintenance window with no background work).
+    deploy:
+      replicas: ${OPENFARM_PROCESSOR_REPLICAS:-1}
     environment:
       DATABASE_URL: ${DATABASE_URL:?required}
       DATABASE_URL_SYNC: ${DATABASE_URL_SYNC:?required}
@@ -141,9 +150,8 @@ services:
       db: { condition: service_healthy }
       redis: { condition: service_healthy }
     networks:
-      default: {}
-    # Proposed: the worker answers a Celery ping. Generous timings, the ping
-    # only needs the broker and the local worker process.
+      shared: {}
+    # Proposed: the worker answers a Celery ping.
     healthcheck:
       test: ["CMD-SHELL", "celery -A app.worker inspect ping -d celery@$$HOSTNAME --timeout 10 | grep -q pong"]
       interval: 60s
@@ -169,8 +177,7 @@ services:
     depends_on:
       minio: { condition: service_healthy }
     networks:
-      default: {}
-      coolify:
+      shared:
         aliases: ["${OPENFARM_NETWORK_ALIAS:?required}-tiler"]
     # Proposed: same /healthz the AgroMind backend already checks.
     healthcheck:
@@ -186,5 +193,9 @@ volumes:
   miniodata: {}
 
 networks:
-  coolify:
+  # Joined by ALL services (Coolify behaviour, see header). Must be dedicated:
+  # an isolated --internal network for rehearsals, or a network reserved for
+  # OpenFarm + the AgroMind backend in production. Never `coolify`.
+  shared:
     external: true
+    name: ${OPENFARM_SHARED_NETWORK:?required}
