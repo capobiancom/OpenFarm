@@ -73,7 +73,24 @@ async def create_org(
     current_user: Annotated[CurrentUser, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
+    # Idempotent provisioning (AgroMind integration): a client-supplied id
+    # that already exists returns the existing org if the caller is a member.
+    if body.id is not None:
+        existing = await db.get(Org, body.id)
+        if existing is not None:
+            member = await db.scalar(
+                select(OrgMember).where(
+                    OrgMember.org_id == existing.id,
+                    OrgMember.user_id == current_user.id,
+                )
+            )
+            if member is None:
+                raise HTTPException(status_code=409, detail="Org id already exists")
+            return existing
+
     org = Org(name=body.name, created_by=current_user.id)
+    if body.id is not None:
+        org.id = body.id
     db.add(org)
     await db.flush()
     logger.info(

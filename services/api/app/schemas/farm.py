@@ -17,6 +17,8 @@ class FarmCreate(BaseModel):
     country: str | None = None
     region: str | None = None
     timezone: str | None = None
+    # AgroMind integration: client-supplied id for idempotent provisioning.
+    id: uuid.UUID | None = None
 
 
 class FarmUpdate(BaseModel):
@@ -49,6 +51,12 @@ class FieldCreate(BaseModel):
     crop_type: str | None = None
     season: str | None = None
     tags: list[str] | None = None
+    # AgroMind integration: a client-supplied id makes creation idempotent
+    # across retries (a lost response never duplicates the field), and
+    # backfill_months bounds the initial analysis window (default: server
+    # setting index_backfill_months).
+    id: uuid.UUID | None = None
+    backfill_months: int | None = PydanticField(default=None, ge=1, le=24)
 
 
 class FieldUpdate(BaseModel):
