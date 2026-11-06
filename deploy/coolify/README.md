@@ -47,5 +47,15 @@ Two Coolify Docker Compose resources, both built from this fork, branch `deploy/
   `celery -A app.worker call app.tasks.reprocess.reprocess_stored_layers` (plan first, read-only:
   `python -m app.tasks.reprocess`); it re-reads the exact stored scenes, overwrites the COG at the same key,
   upserts the layer and updates its field_stats row.
+- **Datos enviados a Element84 (STAC).** Searches send only the field's bounding box rounded OUTWARD to
+  `STAC_BBOX_DECIMALS` decimal degrees (default 2, about 1.1 km; floor for min, ceil for max, so the box
+  always contains the field), plus collection, date range and `eo:cloud_cover < 20`. The polygon, its
+  vertices and its centroid are never sent; reprocessing sends only stored scene ids. The real geometry
+  stays in the engine: returned items are filtered locally (footprint must intersect the field) and, per
+  ISO week, the item with the highest footprint coverage of the field wins, then the lowest cloud cover.
+  Band reads go to AWS S3 (`sentinel-cogs`) as HTTP range requests for the COG blocks under the field, so
+  S3 sees the tile and the approximate read window. Not changed here and still precise: Open-Meteo
+  (weather backfill, daily refresh and forecast) receives the field centroid lat/lon unrounded; ISRIC
+  SoilGrids WCS receives a 1 km box around the centroid (Homolosine metres).
 - **JWT secret rotation and tiler scoping:** [JWT_ROTATION.md](JWT_ROTATION.md).
 - Deploy manually (auto-deploy off, no webhook). Order: CORE → EDGE → AgroMind backend → frontend.

@@ -1,5 +1,6 @@
 """OpenFarm API - Core configuration."""
 
+from pydantic import Field
 from pydantic_settings import BaseSettings
 
 
@@ -35,6 +36,10 @@ class Settings(BaseSettings):
 
     # STAC
     stac_api_url: str = "https://earth-search.aws.element84.com/v1"
+    # Privacy: STAC searches send only the field's bounding box rounded
+    # OUTWARD (floor min, ceil max) to this many decimal degrees, never the
+    # polygon itself. 2 decimals is about 1.1 km. Allowed range 0..6.
+    stac_bbox_decimals: int = Field(default=2, ge=0, le=6)
 
     # TiTiler
     titiler_internal_url: str = "http://tiler:80"

@@ -23,6 +23,7 @@ from __future__ import annotations
 import os
 import tempfile
 from datetime import date, datetime, timezone
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import Any
 
 import numpy as np
@@ -34,6 +35,8 @@ from rio_cogeo.cogeo import cog_translate
 from rio_cogeo.profiles import cog_profiles
 from minio import Minio
 from pystac_client import Client as STACClient
+from shapely.geometry import shape
+from shapely.validation import make_valid
 from sqlalchemy import func, literal, select
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -53,6 +56,12 @@ STAC_API_URL = os.environ.get(
 )
 STAC_COLLECTION = os.environ.get("STAC_COLLECTION", "sentinel-2-l2a")
 MAX_CLOUD_COVER = 20
+# Upper bound on items read from one STAC search. A rounded bbox can touch
+# more MGRS tiles than the polygon did; the limit must never cut a window.
+STAC_MAX_ITEMS = 500
+# Footprint coverage of the field is compared at this precision, so float
+# noise (0.99999 vs 1.0) never outranks a lower cloud cover.
+COVERAGE_DECIMALS = 3
 PIPELINE_VERSION = "3.0.0"
 
 # Sentinel-2 L2A Scene Classification (SCL) classes masked out of every index.
@@ -277,49 +286,142 @@ def scenes_by_ids(scene_ids: list[str], index_def: IndexDef) -> list[dict]:
     return [by_date[d] for d in sorted(by_date)]
 
 
+# ── Privacy-preserving STAC search ──────────────────────────────────
+
+
+def outward_bbox(bounds: tuple | list, decimals: int) -> list[float]:
+    """Bounding box rounded OUTWARD to ``decimals`` decimal degrees.
+
+    ``bounds`` is ``(minx, miny, maxx, maxy)`` in EPSG:4326. Minimums are
+    floored and maximums ceiled (towards -inf / +inf, so it is also outward
+    for negative coordinates), hence the result always contains the input.
+    Decimal arithmetic on the shortest repr avoids float drift (e.g.
+    ``-63.15 * 100``). Only this box is sent to the STAC API: the field
+    polygon itself never leaves the engine.
+    """
+    if not 0 <= int(decimals) <= 6:
+        raise ValueError(f"bbox decimals must be within 0..6, got {decimals}")
+    q = Decimal(1).scaleb(-int(decimals))
+    minx, miny, maxx, maxy = (Decimal(repr(float(v))) for v in bounds)
+    if minx > maxx or miny > maxy:
+        raise ValueError(f"invalid bounds {bounds}")
+    out = [
+        float(minx.quantize(q, rounding=ROUND_FLOOR)),
+        float(miny.quantize(q, rounding=ROUND_FLOOR)),
+        float(maxx.quantize(q, rounding=ROUND_CEILING)),
+        float(maxy.quantize(q, rounding=ROUND_CEILING)),
+    ]
+    out[0], out[2] = max(out[0], -180.0), min(out[2], 180.0)
+    out[1], out[3] = max(out[1], -90.0), min(out[3], 90.0)
+    return out
+
+
+def stac_search_bbox(field_geom) -> list[float]:
+    """The bbox sent to STAC for a field (shapely geometry)."""
+    return outward_bbox(field_geom.bounds, settings.stac_bbox_decimals)
+
+
+def footprint_coverage(item_geometry: dict | None, field_geom) -> float:
+    """Fraction (0..1) of the field area inside the item's data footprint.
+
+    Computed locally with the real field geometry. Planar degrees are fine
+    for a ratio at field scale. A missing or empty footprint counts as 0.
+    """
+    if not item_geometry or field_geom.is_empty or field_geom.area <= 0:
+        return 0.0
+    try:
+        footprint = shape(item_geometry)
+        if not footprint.is_valid:
+            footprint = make_valid(footprint)
+        inter = footprint.intersection(field_geom).area
+    except Exception as exc:  # malformed footprint: never pick it blindly
+        logger.warning("stac_footprint_invalid", error=str(exc))
+        return 0.0
+    return max(0.0, min(1.0, inter / field_geom.area))
+
+
+def select_weekly_items(
+    items: list, field_geom, default_date: date
+) -> list[dict]:
+    """One item per ISO week that actually covers the field.
+
+    Items whose footprint does not intersect the real field geometry (a
+    bbox search also returns tiles that only touch the box) are dropped.
+    Within each week the item with the highest footprint coverage of the
+    field wins; ties (at ``COVERAGE_DECIMALS``) go to the lowest
+    ``eo:cloud_cover``, then the earliest date, then the item id, so the
+    choice is deterministic. Returns dicts ``{item, cloud, date, coverage}``
+    sorted by week.
+    """
+    weekly: dict[str, dict] = {}
+    for item in items:
+        coverage = footprint_coverage(getattr(item, "geometry", None), field_geom)
+        if coverage <= 0:
+            continue
+        item_date = item.datetime.date() if item.datetime else default_date
+        year, week, _ = item_date.isocalendar()
+        week_str = f"{year}-W{week:02d}"
+        cloud = item.properties.get("eo:cloud_cover", 100)
+        cloud = 100 if cloud is None else cloud
+        entry = {"item": item, "cloud": cloud, "date": item_date, "coverage": coverage}
+        rank = (-round(coverage, COVERAGE_DECIMALS), cloud, item_date, item.id)
+        if week_str not in weekly or rank < weekly[week_str]["rank"]:
+            weekly[week_str] = {**entry, "rank": rank}
+    return [
+        {k: v for k, v in weekly[w].items() if k != "rank"} for w in sorted(weekly)
+    ]
+
+
 def search_scenes(
     field_geom_geojson: dict,
     date_from: date,
     date_to: date,
     index_def: IndexDef,
 ) -> list[dict]:
-    """Search Element84 STAC and resolve per-band HREFs for the given index."""
+    """Search Element84 STAC and resolve per-band HREFs for the given index.
+
+    Element84 only receives the outward-rounded bbox (``stac_search_bbox``);
+    the polygon stays here and filters/ranks the returned items locally.
+    """
+    field_geom = shape(field_geom_geojson)
+    if not field_geom.is_valid:
+        field_geom = make_valid(field_geom)
+    bbox = stac_search_bbox(field_geom)
     catalog = STACClient.open(STAC_API_URL)
     search = catalog.search(
         collections=[STAC_COLLECTION],
-        intersects=field_geom_geojson,
+        bbox=bbox,
         datetime=f"{date_from.isoformat()}/{date_to.isoformat()}",
         query={"eo:cloud_cover": {"lt": MAX_CLOUD_COVER}},
-        max_items=100,
+        max_items=STAC_MAX_ITEMS,
     )
     items = list(search.items())
+    if len(items) >= STAC_MAX_ITEMS:
+        logger.warning(
+            "stac_search_truncated",
+            max_items=STAC_MAX_ITEMS,
+            index=index_def.key,
+            date_from=str(date_from),
+            date_to=str(date_to),
+        )
+    weekly = select_weekly_items(items, field_geom, date_from)
     logger.info(
         "stac_search_results",
         count=len(items),
+        weeks=len(weekly),
         index=index_def.key,
         date_from=str(date_from),
         date_to=str(date_to),
+        bbox_decimals=settings.stac_bbox_decimals,
     )
-    if not items:
-        return []
-
-    # Group by week, pick lowest cloud cover per week
-    weekly: dict[str, Any] = {}
-    for item in items:
-        item_date = item.datetime.date() if item.datetime else date_from
-        week_key = item_date.isocalendar()[:2]
-        week_str = f"{week_key[0]}-W{week_key[1]:02d}"
-        cloud = item.properties.get("eo:cloud_cover", 100)
-        if week_str not in weekly or cloud < weekly[week_str]["cloud"]:
-            weekly[week_str] = {"item": item, "cloud": cloud, "date": item_date}
 
     scenes = []
-    for week_str in sorted(weekly.keys()):
-        entry = weekly[week_str]
+    for entry in weekly:
         # Only include the scene if all required bands (and SCL) resolved
         scene = scene_from_item(entry["item"], index_def, entry["date"])
         if scene is not None:
             scene["cloud_cover"] = entry["cloud"]
+            scene["footprint_coverage"] = round(entry["coverage"], 4)
             scenes.append(scene)
 
     return scenes

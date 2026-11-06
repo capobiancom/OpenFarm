@@ -47,7 +47,9 @@ from app.tasks.pipeline import (
     STAC_COLLECTION,
     MAX_CLOUD_COVER,
     MINIO_BUCKET,
+    footprint_coverage,
     get_minio_client,
+    stac_search_bbox,
     get_db_session,
     update_job_progress,
     complete_step,
@@ -104,21 +106,31 @@ def _search_stac_bbox(
     date_to: date,
     max_scenes: int = 5,
 ) -> list[dict]:
-    """Search STAC for Sentinel-2 scenes intersecting bbox."""
-    from pystac_client import Client as STACClient
+    """Search STAC for Sentinel-2 scenes intersecting bbox.
 
+    Element84 receives the requested bbox rounded outward
+    (``stac_search_bbox``); items are then filtered locally against the
+    exact requested box and ranked by footprint coverage, then cloud cover.
+    """
+    from pystac_client import Client as STACClient
+    from shapely.geometry import box
+
+    area = box(*bbox)
     catalog = STACClient.open(STAC_API_URL)
     search = catalog.search(
         collections=[STAC_COLLECTION],
-        bbox=bbox,
+        bbox=stac_search_bbox(area),
         datetime=f"{date_from.isoformat()}/{date_to.isoformat()}",
         query={"eo:cloud_cover": {"lt": MAX_CLOUD_COVER}},
-        max_items=50,
+        max_items=200,
     )
-    items = sorted(
-        search.items(),
-        key=lambda it: it.properties.get("eo:cloud_cover", 100),
-    )
+    ranked = []
+    for it in search.items():
+        cov = footprint_coverage(it.geometry, area)
+        if cov > 0:
+            cloud = it.properties.get("eo:cloud_cover", 100)
+            ranked.append(((-round(cov, 3), 100 if cloud is None else cloud, it.id), it))
+    items = [it for _, it in sorted(ranked, key=lambda r: r[0])]
 
     scenes = []
     for item in items[:max_scenes]:

@@ -96,6 +96,7 @@ services:
     # reach the app (an empty integer crashes its settings on boot).
     environment:
       STAC_API_URL: ${STAC_API_URL:-https://earth-search.aws.element84.com/v1}
+      STAC_BBOX_DECIMALS: ${STAC_BBOX_DECIMALS:-2}
       SOILGRIDS_WCS_BASE_URL: ${SOILGRIDS_WCS_BASE_URL:-https://maps.isric.org/mapserv?map=/map}
       SOIL_FETCH_TIMEOUT_SECONDS: ${SOIL_FETCH_TIMEOUT_SECONDS:-60}
       SOIL_SOURCE_PRIORITY: ${SOIL_SOURCE_PRIORITY:-soilgrids}
