@@ -257,16 +257,17 @@ def test_weekly_dispatch_only_stale_eligible_fields_without_backfill(db, world, 
 
     result = schedule_weekly_index_compute()
 
-    assert result["fields_dispatched"] == 1 and result["jobs_dispatched"] == 4
+    # one job per registered index, NDMI included
+    assert result["fields_dispatched"] == 1 and result["jobs_dispatched"] == 5
     jobs = db.execute(select(Job)).scalars().all()
     assert {j.field_id for j in jobs} == {stale.id}
-    assert sorted(j.type for j in jobs) == ["evi", "ndvi", "ndwi", "savi"]
+    assert sorted(j.type for j in jobs) == ["evi", "ndmi", "ndvi", "ndwi", "savi"]
     for j in jobs:
         assert "is_backfill" not in j.params_json
         assert j.params_json["trigger"] == "scheduled_weekly"
         assert j.params_json["date_from"] == str(TODAY - timedelta(days=14))
         assert j.params_json["date_to"] == str(TODAY)
-    assert len(sent) == 4 and {c[1] for c in sent} == {str(j.id) for j in jobs}
+    assert len(sent) == 5 and {c[1] for c in sent} == {str(j.id) for j in jobs}
 
 
 def test_weekly_dispatch_is_idempotent(db, world, sent):
@@ -274,15 +275,15 @@ def test_weekly_dispatch_is_idempotent(db, world, sent):
     from app.tasks.backfill import schedule_weekly_index_compute
 
     world["add_field"]("stale", latest=TODAY - timedelta(days=15))
-    assert schedule_weekly_index_compute()["jobs_dispatched"] == 4
+    assert schedule_weekly_index_compute()["jobs_dispatched"] == 5
     # Beat restart / redelivery / manual re-run: no new jobs.
     assert schedule_weekly_index_compute()["jobs_dispatched"] == 0
     # Even after the first jobs finished, the scheduled run is not repeated.
     db.execute(Job.__table__.update().values(status="completed"))
     db.commit()
     assert schedule_weekly_index_compute()["jobs_dispatched"] == 0
-    assert db.execute(select(func.count()).select_from(Job)).scalar() == 4
-    assert len(sent) == 4
+    assert db.execute(select(func.count()).select_from(Job)).scalar() == 5
+    assert len(sent) == 5
 
 
 def test_weekly_dispatch_skips_fields_with_work_in_flight(db, world, sent):
@@ -315,27 +316,45 @@ def test_weekly_dispatch_respects_advisory_lock(db, world, sent):
 # ── Pipeline: alerts off, no scenes, reprocessing ────────────────────
 
 
-def _fake_scene(day):
+_REFL = {"scale": 1e-4, "offset": 0.0, "source": "boa_offset_applied_by_provider", "nodata": 0}
+
+
+def _fake_scene(day, bands=("B03", "B08")):
     return {
         "id": f"S2X_TEST_{day:%Y%m%d}",
         "date": day,
         "cloud_cover": 1.0,
-        "band_hrefs": {"B03": "https://example/B03.tif", "B08": "https://example/B08.tif"},
+        "band_hrefs": {b: f"https://example/{b}.tif" for b in bands},
+        "scl_href": "https://example/SCL.tif",
+        "reflectance": {b: dict(_REFL) for b in bands},
     }
 
 
 @pytest.fixture()
 def fake_sentinel(monkeypatch):
-    """No network: fixed scenes, bands with NDWI ~ -0.5, COG write skipped."""
+    """No network: fixed scenes, bands with NDWI ~ -0.5, COG write skipped.
+
+    DN: B03 1000, B08 3000, B04 500, B11 1500 (reflectance 0.1/0.3/0.05/0.15),
+    SCL all vegetation (4).
+    """
     import app.tasks.pipeline as pipeline
     import app.tasks.vegetation as vegetation
 
     scenes: list[dict] = []
     monkeypatch.setattr(vegetation, "search_scenes", lambda *a, **k: list(scenes))
+    monkeypatch.setattr(
+        vegetation,
+        "scenes_by_ids",
+        lambda ids, idx: [dict(_fake_scene(sc["date"], idx.bands), id=sc["id"])
+                          for sc in scenes if sc["id"] in ids],
+    )
+    dn = {"B03": 1000.0, "B08": 3000.0, "B04": 500.0, "B11": 1500.0, "B02": 300.0}
 
-    def fake_band(href, bounds, target_shape, target_transform):
-        value = 0.1 if href.endswith("B03.tif") else 0.3
-        return np.full(target_shape, value, dtype="float32")
+    def fake_band(href, bounds, target_shape, target_transform, *, categorical=False, nodata=0):
+        if categorical:
+            return np.full(target_shape, 4, dtype="uint8"), np.ones(target_shape, dtype=bool)
+        value = dn[href.rsplit("/", 1)[1].removesuffix(".tif")]
+        return np.full(target_shape, value, dtype="float32"), np.ones(target_shape, dtype=bool)
 
     monkeypatch.setattr(pipeline, "read_band_windowed", fake_band)
     monkeypatch.setattr(
@@ -379,16 +398,119 @@ def test_normal_processing_creates_no_alerts_when_rules_disabled(db, world, fake
     assert db.execute(select(func.count()).select_from(Alert)).scalar() == 0  # ... no alerts
 
 
+def _run_job(db, field, user, index, date_from, date_to, extra=None):
+    from app.models.tables import Job
+    from app.tasks import vegetation
+
+    job = Job(org_id=field.org_id, field_id=field.id, type=index, status="pending",
+              params_json={"date_from": str(date_from), "date_to": str(date_to), **(extra or {})},
+              created_by=user.id)
+    db.add(job)
+    db.commit()
+    result = getattr(vegetation, f"process_{index}", None)
+    if result is None:
+        from app.tasks.ndvi import process_ndvi as result
+    out = result(str(job.id))
+    db.expire_all()
+    return db.get(Job, job.id), out
+
+
 def test_same_run_creates_alerts_only_if_rules_enabled(db, world, fake_sentinel, monkeypatch):
-    """Control: proves the flag (not the data) is what suppresses alerts."""
+    """Control: proves the flag (not the data) is what suppresses alerts.
+
+    Uses NDVI with a low value (threshold rule): NDWI has no alert rule.
+    """
+    from app.core.config import settings
+    from app.models.tables import Alert
+
+    monkeypatch.setattr(settings, "openfarm_alert_rules_enabled", True)
+    f = world["add_field"]("lot", latest=TODAY - timedelta(days=20))
+    fake_sentinel.append(_fake_scene(TODAY - timedelta(days=5), ("B04", "B08")))
+    import app.tasks.pipeline as pipeline
+
+    real = pipeline.read_band_windowed
+
+    def low_ndvi(href, *a, **k):  # red 0.25, nir 0.30 -> NDVI 0.09 < 0.3
+        arr, valid = real(href, *a, **k)
+        if href.endswith("B04.tif"):
+            arr = np.full_like(arr, 2500.0)
+        return arr, valid
+
+    monkeypatch.setattr(pipeline, "read_band_windowed", low_ndvi)
+    _run_job(db, f, world["user"], "ndvi", TODAY - timedelta(days=19), TODAY)
+    assert db.execute(select(func.count()).select_from(Alert)).scalar() > 0
+
+
+def test_ndwi_never_creates_alerts_even_with_rules_enabled(db, world, fake_sentinel, monkeypatch):
     from app.core.config import settings
     from app.models.tables import Alert
 
     monkeypatch.setattr(settings, "openfarm_alert_rules_enabled", True)
     f = world["add_field"]("lot", latest=TODAY - timedelta(days=20))
     fake_sentinel.append(_fake_scene(TODAY - timedelta(days=5)))
-    _run_ndwi_job(db, f, world["user"], TODAY - timedelta(days=19), TODAY)
-    assert db.execute(select(func.count()).select_from(Alert)).scalar() > 0
+    job, _ = _run_ndwi_job(db, f, world["user"], TODAY - timedelta(days=19), TODAY)
+    assert job.status == "completed"
+    assert db.execute(select(func.count()).select_from(Alert)).scalar() == 0
+
+
+def test_layer_records_quality_and_pipeline_version(db, world, fake_sentinel):
+    from app.models.tables import FieldStat, RasterLayer
+
+    f = world["add_field"]("lot", latest=TODAY - timedelta(days=20))
+    day = TODAY - timedelta(days=5)
+    fake_sentinel.append(_fake_scene(day, ("B08", "B11")))
+    job, _ = _run_job(db, f, world["user"], "ndmi", TODAY - timedelta(days=19), TODAY)
+    assert job.status == "completed"
+    layer = db.execute(
+        select(RasterLayer).where(RasterLayer.field_id == f.id, RasterLayer.layer_type == "NDMI")
+    ).scalar_one()
+    p = layer.params_json
+    assert p["pipeline_version"] == "3.0.0" and p["scl_masked"] is True
+    assert p["field_cloud_fraction"] == 0.0 and p["field_nodata_fraction"] == 0.0
+    assert p["reflectance"]["B11"] == {"scale": 1e-4, "offset": 0.0,
+                                       "source": "boa_offset_applied_by_provider"}
+    assert layer.provenance_json["pipeline_version"] == "3.0.0"
+    assert layer.provenance_json["scl"].endswith("SCL.tif")
+    stat = db.execute(select(FieldStat).where(FieldStat.layer_id == layer.id)).scalar_one()
+    assert float(stat.mean) == pytest.approx(0.15 / 0.45, abs=1e-3)
+    # quality = clear fraction inside the polygon, all clear here
+    assert float(stat.quality_score) == pytest.approx(1.0)
+
+
+def test_reprocess_plan_targets_old_layers_and_adds_ndmi(db, world, fake_sentinel, sent):
+    from app.models.tables import Job, RasterLayer
+    from app.tasks.reprocess import plan_reprocess, reprocess_stored_layers
+
+    day = TODAY - timedelta(days=20)
+    f = world["add_field"]("lot", latest=day)
+    world["add_field"]("gone", latest=day, deleted=True)
+    plans = plan_reprocess(db)
+    assert {p["index"] for p in plans} == {"ndvi", "evi", "savi", "ndwi", "ndmi"}
+    assert all(p["field_id"] == f.id and p["scene_ids"] == ["ORIG"] for p in plans)
+    assert [p["new_layers"] for p in plans if p["index"] == "ndmi"] == [1]
+
+    summary = reprocess_stored_layers(dry_run=True)
+    assert summary["jobs"] == 5 and sent == []
+
+    summary = reprocess_stored_layers()
+    assert summary["jobs"] == 5 and len(sent) == 5
+    jobs = db.execute(select(Job).where(Job.field_id == f.id)).scalars().all()
+    assert all(j.params_json["scene_ids"] == ["ORIG"] and j.params_json["is_backfill"] for j in jobs)
+    assert all(j.params_json["trigger"] == "reprocess_3.0.0" for j in jobs)
+
+    # Running one of them (NDWI) with the stored scene brings it to 3.0.0 ...
+    db.execute(delete(Job))
+    db.commit()
+    fake_sentinel.append(dict(_fake_scene(day), id="ORIG"))
+    job, _ = _run_ndwi_job(db, f, world["user"], day, day, {"scene_ids": ["ORIG"], "is_backfill": True})
+    assert job.status == "completed"
+    layer = db.execute(
+        select(RasterLayer).where(RasterLayer.field_id == f.id, RasterLayer.layer_type == "NDWI")
+    ).scalar_one()
+    assert layer.params_json["pipeline_version"] == "3.0.0"
+    assert "scene_ids" not in layer.params_json["last_reprocess"]
+    # ... so the next plan no longer lists it.
+    assert "ndwi" not in {p["index"] for p in plan_reprocess(db)}
 
 
 def test_no_new_scenes_completes_without_touching_layers(db, world, fake_sentinel):

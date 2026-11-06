@@ -1,4 +1,4 @@
-"""Vegetation index tasks - EVI, SAVI, NDWI.
+"""Vegetation index tasks - EVI, SAVI, NDWI, NDMI (NDVI delegates here).
 
 Each task follows the same 7-step pipeline as NDVI but uses the
 index registry for formula selection, band resolution, and alert defaults.
@@ -24,6 +24,7 @@ from app.tasks.pipeline import (
     update_job_progress,
     complete_step,
     search_scenes,
+    scenes_by_ids,
     compute_target_grid,
     process_scene,
 )
@@ -36,7 +37,7 @@ logger = structlog.get_logger()
 
 def _run_index_pipeline(self, job_id: str, index_key: str) -> dict:
     """Shared entry-point logic for any vegetation-index Celery task."""
-    from app.models.tables import Job, Field, FieldStat
+    from app.models.tables import Job, Field, FieldStat, RasterLayer
 
     index_def = get_index(index_key)
     session = get_db_session()
@@ -73,9 +74,13 @@ def _run_index_pipeline(self, job_id: str, index_key: str) -> dict:
             k: v for k, v in params.items() if k not in ("date_from", "date_to")
         }
 
-        # Step 1: Scene Search
+        # Step 1: Scene Search. A reprocess job names the exact stored
+        # scenes; any other job searches the window.
         update_job_progress(session, job, "scene_search")
-        scenes = search_scenes(field_geom_geojson, date_from, date_to, index_def)
+        if params.get("scene_ids"):
+            scenes = scenes_by_ids(list(params["scene_ids"]), index_def)
+        else:
+            scenes = search_scenes(field_geom_geojson, date_from, date_to, index_def)
         complete_step(session, job, "scene_search", {"scene_count": len(scenes)})
 
         if not scenes:
@@ -95,11 +100,16 @@ def _run_index_pipeline(self, job_id: str, index_key: str) -> dict:
             field_geom.bounds, field_geom
         )
 
-        # Historical means for alerts
+        # Historical means for alerts (same index only: mixing NDVI with
+        # EVI/SAVI/NDWI means made the drop rule meaningless)
         existing_stats = (
             session.execute(
                 select(FieldStat.mean)
-                .where(FieldStat.field_id == job.field_id)
+                .join(RasterLayer, RasterLayer.id == FieldStat.layer_id)
+                .where(
+                    FieldStat.field_id == job.field_id,
+                    RasterLayer.layer_type == index_def.label,
+                )
                 .order_by(FieldStat.date.asc())
             )
             .scalars()
@@ -224,5 +234,20 @@ def process_savi(self, job_id: str) -> dict:
     soft_time_limit=1500,
 )
 def process_ndwi(self, job_id: str) -> dict:
-    """Process NDWI for a field."""
+    """Process NDWI (McFeeters, surface water) for a field."""
     return _run_index_pipeline(self, job_id, "ndwi")
+
+
+# ── NDMI ─────────────────────────────────────────────────────────────
+
+
+@celery_app.task(
+    name="app.tasks.vegetation.process_ndmi",
+    bind=True,
+    max_retries=3,
+    time_limit=1800,
+    soft_time_limit=1500,
+)
+def process_ndmi(self, job_id: str) -> dict:
+    """Process NDMI (vegetation moisture, NIR/SWIR1) for a field."""
+    return _run_index_pipeline(self, job_id, "ndmi")

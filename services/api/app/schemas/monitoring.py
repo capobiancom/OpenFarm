@@ -11,7 +11,7 @@ from pydantic import BaseModel, field_validator
 
 # ── Index Type ───────────────────────────────────────────────────────
 
-IndexType = Literal["ndvi", "evi", "savi", "ndwi"]
+IndexType = Literal["ndvi", "evi", "savi", "ndwi", "ndmi"]
 
 
 # ── Raster / NDVI Layers ─────────────────────────────────────────────

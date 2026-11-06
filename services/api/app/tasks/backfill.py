@@ -46,7 +46,7 @@ def backfill_indices_for_field(
     months: int | None = None,
     sentinel_job_id: str | None = None,
 ) -> dict:
-    """Backfill all 4 vegetation indices for *field_id* over *months*.
+    """Backfill every registered index (INDEX_REGISTRY) for *field_id* over *months*.
 
     Splits the date range into 90-day chunks and dispatches one
     pipeline job per (chunk × index) with staggered countdowns.

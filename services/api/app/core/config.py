@@ -12,6 +12,12 @@ class Settings(BaseSettings):
 
     # JWT
     openfarm_jwt_secret: str = "change-me"
+    # Rotation without downtime: tokens signed with this previous secret are
+    # still ACCEPTED (verification only, never used to sign) while clients
+    # switch to the new OPENFARM_JWT_SECRET. Empty = disabled. Remove it once
+    # the longest token TTL has passed after the switch
+    # (deploy/coolify/JWT_ROTATION.md).
+    openfarm_jwt_secret_previous: str = ""
     jwt_algorithm: str = "HS256"
     jwt_ttl_seconds: int = 3600  # 1 hour
 

@@ -7,12 +7,12 @@ from dataclasses import dataclass
 from typing import Annotated
 
 from fastapi import Depends, Header, HTTPException, status
-from jose import JWTError, jwt
+from jose import JWTError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import settings
 from app.core.database import get_db
+from app.core.jwt_keys import decode_token
 
 
 @dataclass
@@ -45,9 +45,7 @@ async def get_current_user(
 
     token = authorization.removeprefix("Bearer ").strip()
     try:
-        payload = jwt.decode(
-            token, settings.openfarm_jwt_secret, algorithms=[settings.jwt_algorithm]
-        )
+        payload = decode_token(token)
     except JWTError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token"

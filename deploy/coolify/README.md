@@ -37,4 +37,15 @@ Two Coolify Docker Compose resources, both built from this fork, branch `deploy/
     catch-up of missed runs).
 - **Alerts.** `OPENFARM_ALERT_RULES_ENABLED=false` (runtime, CORE and EDGE) disables the index and soil alert
   rules; processing still stores indices and weather. Keep it false until the rules are fixed.
+- **Index pipeline 3.0.0.** Bands are converted to surface reflectance with each STAC item's metadata
+  (Element84 items have `earthsearch:boa_offset_applied=true`: the -1000 BOA offset is already in the
+  pixels, so only the 1e-4 scale is applied), nodata is NaN, SCL classes 0, 1, 3, 8, 9, 10, 11 are masked,
+  and `quality_score` is the clear fraction inside the field polygon. Per layer, `params_json` holds
+  `pipeline_version`, `cloud_cover`, `field_cloud_fraction`, `field_nodata_fraction`, `scl_masked` and the
+  `reflectance` scale/offset used. New index `ndmi` (NIR/SWIR1, vegetation moisture); `ndwi` is McFeeters
+  surface water and has no alert rule. Stored layers produced by an older version are reprocessed with
+  `celery -A app.worker call app.tasks.reprocess.reprocess_stored_layers` (plan first, read-only:
+  `python -m app.tasks.reprocess`); it re-reads the exact stored scenes, overwrites the COG at the same key,
+  upserts the layer and updates its field_stats row.
+- **JWT secret rotation and tiler scoping:** [JWT_ROTATION.md](JWT_ROTATION.md).
 - Deploy manually (auto-deploy off, no webhook). Order: CORE → EDGE → AgroMind backend → frontend.

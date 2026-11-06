@@ -2,6 +2,12 @@
 
 Every Celery task, API endpoint, and tile URL builder references this
 registry so index behaviour is defined in exactly one place.
+
+Formulas receive surface reflectance (0..1, float) with NaN for invalid
+pixels: ``pipeline.read_scene_bands`` converts Sentinel-2 L2A digital
+numbers with the per-item scale/offset and applies the nodata and SCL
+masks before any formula runs. EVI and SAVI carry additive constants
+(+1 and +L), so they are only meaningful on reflectance, never on raw DN.
 """
 
 from __future__ import annotations
@@ -38,9 +44,18 @@ def _savi(bands: dict[str, np.ndarray], **_kw) -> np.ndarray:
 
 
 def _ndwi(bands: dict[str, np.ndarray], **_kw) -> np.ndarray:
+    """McFeeters (1996) NDWI: open surface water, not canopy water content."""
     green, nir = bands["B03"], bands["B08"]
     with np.errstate(divide="ignore", invalid="ignore"):
         result = (green - nir) / (green + nir)
+    return np.clip(result, -1.0, 1.0)
+
+
+def _ndmi(bands: dict[str, np.ndarray], **_kw) -> np.ndarray:
+    """NDMI (Gao 1996 NDWI, NIR/SWIR1): vegetation water content."""
+    nir, swir1 = bands["B08"], bands["B11"]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        result = (nir - swir1) / (nir + swir1)
     return np.clip(result, -1.0, 1.0)
 
 
@@ -68,9 +83,13 @@ class IndexDef:
     formula: Callable[[dict[str, np.ndarray]], np.ndarray]
     colormap: str  # TiTiler colormap name
     rescale: tuple[float, float]  # min, max for tile rendering
-    alerts: AlertDefaults
+    # None = no threshold/drop alert rule is ever evaluated for this index
+    # (e.g. NDWI measures open water, a low value is not crop stress).
+    alerts: AlertDefaults | None
     stac_asset_map: dict[str, tuple[str, ...]] = field(default_factory=dict)
     # stac_asset_map: band_key → (primary_asset, fallback_asset, ...)
+    name: str = ""  # human-readable name for UIs and API metadata
+    description: str = ""  # what the index measures
 
 
 # ── Registry ─────────────────────────────────────────────────────────
@@ -86,6 +105,8 @@ _register(
     IndexDef(
         key="ndvi",
         label="NDVI",
+        name="Vegetation vigor (NDVI)",
+        description="Normalized Difference Vegetation Index, (B08 - B04) / (B08 + B04).",
         bands=("B04", "B08"),
         formula=_ndvi,
         colormap="rdylgn",
@@ -102,6 +123,11 @@ _register(
     IndexDef(
         key="evi",
         label="EVI",
+        name="Enhanced vegetation index (EVI)",
+        description=(
+            "2.5 (B08 - B04) / (B08 + 6 B04 - 7.5 B02 + 1) on surface reflectance; "
+            "less saturated than NDVI over dense canopies."
+        ),
         bands=("B02", "B04", "B08"),
         formula=_evi,
         colormap="rdylgn",
@@ -119,6 +145,8 @@ _register(
     IndexDef(
         key="savi",
         label="SAVI",
+        name="Soil-adjusted vegetation index (SAVI)",
+        description="(1 + L) (B08 - B04) / (B08 + B04 + L) on surface reflectance, L = 0.5.",
         bands=("B04", "B08"),
         formula=_savi,
         colormap="rdylgn",
@@ -135,14 +163,47 @@ _register(
     IndexDef(
         key="ndwi",
         label="NDWI",
+        name="Surface water (McFeeters NDWI)",
+        description=(
+            "McFeeters NDWI, (B03 - B08) / (B03 + B08): open surface water and "
+            "flooding (> 0 = water). It is negative over any vegetation and is "
+            "not a measure of crop water content; use NDMI for that."
+        ),
         bands=("B03", "B08"),
         formula=_ndwi,
         colormap="rdbu",
         rescale=(-1.0, 1.0),
-        alerts=AlertDefaults(threshold=0.0, threshold_high=-0.2, drop_pct=20),
+        # No alert rule: the former defaults (threshold 0.0, high -0.2, drop
+        # 20 %) read a low NDWI as crop stress, which is wrong for McFeeters
+        # NDWI (healthy vegetation is always < 0).
+        alerts=None,
         stac_asset_map={
             "B03": ("green", "B03"),
             "B08": ("nir", "B08"),
+        },
+    )
+)
+
+_register(
+    IndexDef(
+        key="ndmi",
+        label="NDMI",
+        name="Vegetation moisture (NDMI)",
+        description=(
+            "Normalized Difference Moisture Index, (B08 - B11) / (B08 + B11), "
+            "B11 = SWIR 1610 nm at 20 m: canopy water content. Typical values: "
+            "bare or dry soil -0.2..0.1, stressed or sparse crop 0.1..0.3, "
+            "well-watered dense canopy 0.3..0.6."
+        ),
+        bands=("B08", "B11"),
+        formula=_ndmi,
+        colormap="brbg",
+        rescale=(-0.2, 0.6),
+        # No alert rule until thresholds are calibrated (rules are off anyway).
+        alerts=None,
+        stac_asset_map={
+            "B08": ("nir", "B08"),
+            "B11": ("swir16", "B11"),
         },
     )
 )

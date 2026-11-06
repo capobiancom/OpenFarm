@@ -14,14 +14,10 @@ def _key_func(request: Request) -> str:
     auth = request.headers.get("Authorization", "")
     if auth.startswith("Bearer "):
         try:
-            from jose import jwt as _jwt
+            from app.core.jwt_keys import decode_token
 
             token = auth.removeprefix("Bearer ").strip()
-            payload = _jwt.decode(
-                token,
-                settings.openfarm_jwt_secret,
-                algorithms=[settings.jwt_algorithm],
-            )
+            payload = decode_token(token)
             sub = payload.get("sub")
             if sub:
                 return f"user:{sub}"

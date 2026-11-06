@@ -69,12 +69,18 @@ def _get_http_client(request) -> httpx.AsyncClient:
     return request.app.state.http_client
 
 
-def _mint_service_jwt() -> str:
-    """Mint a short-lived JWT for internal TiTiler calls."""
-    payload = {
+def _mint_service_jwt(org_id: uuid.UUID | str | None = None) -> str:
+    """Mint a short-lived JWT for internal TiTiler calls.
+
+    ``org_ids`` scopes the token at the tiler to the COGs of that org
+    (services/tiler/tiler_auth.py).
+    """
+    payload: dict = {
         "sub": "service:share-proxy",
         "exp": datetime.now(timezone.utc) + timedelta(minutes=5),
     }
+    if org_id is not None:
+        payload["org_ids"] = [str(org_id)]
     return jwt.encode(
         payload, settings.openfarm_jwt_secret, algorithm=settings.jwt_algorithm
     )
@@ -439,6 +445,7 @@ async def proxy_share_tile(
         "EVI": ("rdylgn", "-0.2,0.8"),
         "SAVI": ("rdylgn", "-0.2,0.8"),
         "NDWI": ("rdbu", "-0.5,0.5"),
+        "NDMI": ("brbg", "-0.2,0.6"),
     }
     idx_upper = index_type.upper()
     colormap, rescale = _INDEX_TILE_PARAMS.get(idx_upper, ("rdylgn", "-0.2,0.9"))
@@ -468,7 +475,7 @@ async def proxy_share_tile(
     )
 
     # Forward request with a service JWT
-    service_token = _mint_service_jwt()
+    service_token = _mint_service_jwt(link.org_id)
     client = _get_http_client(request)
     try:
         resp = await client.get(
